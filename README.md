@@ -1,0 +1,180 @@
+# VHD2Wasabi
+
+Disk2vhd-style live Windows disk capture that streams the image through 7-Zip
+compression **straight into a Wasabi (S3-compatible) bucket** — no local staging
+of the full VHD. RAM buffer is only a few MB; disk spool is at most ONE
+compressed segment (not the whole image).
+
+Single self-contained EXE: `dist\VHD2Wasabi.exe` (PyInstaller onefile, UAC
+admin manifest, bundled `7za.exe`).
+
+## How it works
+
+Per selected volume (multiple volumes are captured **sequentially**, each into
+its own object set — never merged, by design):
+
+1. **VSS snapshot** via WMI:
+   `(Get-WmiObject -List Win32_ShadowCopy).Create("C:\","ClientAccessible")`,
+   shadow ID resolved to `\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy<N>`.
+   The shadow is always deleted in a `finally` (`vssadmin delete shadows`).
+2. **Raw sequential read** of the shadow device with pywin32
+   (`CreateFile`/`ReadFile`, 4 MiB aligned chunks). Volume length comes from
+   `IOCTL_DISK_GET_LENGTH_INFO`.
+3. **Fixed-VHD footer** appended in software: pure-Python 512-byte `conectix`
+   footer (features, version, data offset `0xFFFFFFFFFFFFFFFF`, timestamp,
+   creator, original/current size, CHS geometry per the VHD spec, disk type 2 =
+   fixed, checksum = one's complement of the byte sum). Unit-tested in
+   `test_footer.py`.
+4. **Segmentation**: the uncompressed stream (volume bytes + footer) is cut
+   into fixed-size segments (default 10 GiB uncompressed, configurable). Each
+   segment is compressed independently with 7-Zip
+   (`7za a spool.7z -siData -mx=N`).
+5. **Multipart upload**: each segment becomes ONE S3 object, uploaded with
+   S3 multipart (parts ≥ 8 MiB, 3 retries with backoff, abort on failure).
+   `CompleteMultipartUpload` does the server-side merge of parts.
+   Object keys: `<prefix>/<server>/<YYYY-MM-DD>/<VolumeLabel-or-letter>.partNNN.7z`.
+6. **Hashing**: SHA-256 of uncompressed bytes per segment is computed on the
+   fly; sizes and ETags are recorded. The whole-image hash in the manifest is
+   the SHA-256 of the concatenated per-segment SHA-256 hex strings (a composite
+   that is computable even for resumed runs).
+7. **Manifest**: after each volume (and locally after each segment) a manifest
+   JSON (server, volume, sizes, segment list with sha256/size/etag/key,
+   timestamps, tool version) is written to the bucket next to the objects
+   (`<keyprefix>.manifest.json`) and to
+   `%LOCALAPPDATA%\VHD2Wasabi\state\<server>\<volume>.json`.
+
+### Deviation: spool file instead of archive-to-stdout
+
+The plan called for `7za a -siData -so` piping compressed bytes to stdout.
+**The 7-Zip CLI does not implement `-so` for the `a` command** (returns
+"System ERROR: Not implemented" — verified with both 7za 23.01 and the full
+7z 23.01). A Windows named-pipe archive target was also tested: 7-Zip first
+opens the archive for reading and expects a seekable file, so this hangs.
+Therefore each segment is compressed to a **spool file** in `%TEMP%\VHD2Wasabi-spool`
+which the uploader **tail-uploads concurrently** (near-streaming: upload
+overlaps compression; spool never exceeds one compressed segment and is
+deleted right after). Everything else follows the plan.
+
+## Install / build
+
+```sh
+# dev run
+python app/main.py
+
+# tests
+python test_footer.py
+python test_pipeline_local.py
+
+# build EXE
+python build_exe.py        # -> dist\VHD2Wasabi.exe
+```
+
+`app\resources\7za.exe` is the 7-Zip standalone console from the official
+`7z2301-extra.7z` (https://www.7-zip.org/download.html). If it is missing,
+pre-flight fails with a clear message — place `7za.exe` there (the constant
+`SEVENZIP` in `app/engine/compressor.py` controls the binary name; `7zr.exe`
+also works).
+
+## Usage
+
+1. Run as Administrator (the EXE requests elevation via its manifest).
+2. Tick the volumes to capture (letter, label, total/used/free GB shown).
+3. Fill the Wasabi form: endpoint (default `s3.eu-central-1.wasabisys.com`),
+   bucket, access/secret key, prefix, segment size MB, compression level.
+   **Save/Load profile** stores this in
+   `%LOCALAPPDATA%\VHD2Wasabi\profiles.json` — **it contains secrets**, protect
+   the file.
+4. **Test connection** (HeadBucket) → **Start**.
+5. The status line shows read/compress/upload MB/s so the bottleneck is
+   visible; per-volume progress bar with ETA; scrolling log.
+6. **Cancel** aborts the multipart upload, deletes the snapshot, and preserves
+   state for resume.
+
+### Resume
+
+State is kept per server/volume. On start, segments marked complete are
+verified with HeadObject (size match) and skipped; streaming resumes at the
+next segment (new snapshot, reader seeks to the segment offset). Completed
+volumes are skipped entirely. Resume is automatic when state exists; tick
+**Start fresh** to ignore it.
+
+### Verify
+
+**Verify…** lists manifests in the bucket; pick one. Each segment is:
+HeadObject-checked, downloaded to a temp file, integrity-tested (`7za t`),
+then extracted streaming (`7za x -so`) and re-hashed against the manifest
+SHA-256. Per-segment PASS/FAIL is reported.
+
+## Restore
+
+```sh
+# 1. download the parts (aws CLI, s3cmd, or the Wasabi console)
+aws s3 sync s3://<bucket>/<prefix>/<server>/<date>/ . --endpoint-url https://s3.eu-central-1.wasabisys.com
+
+# 2. extract each part (each is an independent .7z containing stream "Data")
+7za x server.part001.7z     # produces file "Data"
+7za x server.part002.7z     # rename between extracts!
+...
+
+# 3. concatenate in order -> fixed VHD
+copy /b Data001+Data002+Data003 image.vhd
+
+# 4. attach: Disk Management -> Action -> Attach VHD, or mount as a Hyper-V disk
+```
+
+(Extraction always writes a file named `Data`; rename after each part before
+extracting the next.)
+
+## VSS diff-area guidance
+
+Pre-flight shows shadow storage allocation (`vssadmin list shadowstorage`) and
+warns if free space < 5% of volume size. During capture the diff-area usage is
+polled every ~30 s: warning at 80%, clean abort (snapshot deleted, multipart
+aborted, state kept) at ~95%.
+
+Point the diff area at another volume (recommended for busy/occupied disks):
+
+```cmd
+vssadmin add shadowstorage /for=C: /on=E: /maxsize=40GB
+vssadmin list shadowstorage
+vssadmin resize shadowstorage /for=C: /on=E: /maxsize=40GB
+```
+
+## Limitations
+
+- **BitLocker volumes unsupported** (same as Disk2vhd — raw sector capture of
+  an unlocked volume is not attempted; the captured image would be ciphertext).
+- **VHD 2 TB limit**: fixed VHD cannot address more than 2 TiB; larger volumes
+  are rejected at the CHS geometry level (clamped) — split or wait for VHDX (v2).
+- **Volume-level, not whole-disk**: v1 captures volumes (like Disk2vhd's
+  per-volume mode), one VHD stream per volume; no partition table/MBR is
+  included.
+- Whole-image SHA-256 is a composite of per-segment hashes (see How it works).
+- Compression happens on the spool path; ensure `%TEMP%` has room for one
+  compressed segment (typically a few GB for a 10 GiB segment of real data).
+
+## v2 roadmap
+
+- Whole-disk mode (partition table + all volumes in one stream)
+- Parallel volume capture
+- VHDX output (4 KB sectors, > 2 TB)
+- Optional client-side encryption before upload
+- Delta/incremental capture
+
+## Layout
+
+```
+app\main.py            Tkinter UI + wiring
+app\engine\snapshot.py     VSS create/resolve/delete, shadow storage parsing
+app\engine\volumereader.py volume enumeration + raw shadow device reader
+app\engine\vhdfooter.py    fixed-VHD footer (pure Python)
+app\engine\compressor.py   7-Zip segment compressor (spool)
+app\engine\uploader.py     S3/local multipart stores + concurrent tail-uploader
+app\engine\pipeline.py     orchestration: segments, resume, cancel, verify
+app\engine\manifest.py     state/manifest JSON
+app\engine\preflight.py    admin/VSS/7za/bucket/shadow-storage checks
+app\resources\7za.exe      bundled 7-Zip console
+build_exe.py               PyInstaller wrapper
+test_footer.py             footer checksum/field smoke test
+test_pipeline_local.py     synthetic 200 MiB round-trip test (no S3)
+```
