@@ -101,3 +101,9 @@ def validate_footer(footer_bytes, expected_size=None):
         "current_size": current,
         "checksum": stored,
     }
+
+
+def parse_footer(footer_bytes):
+    """Parse + validate a 512-byte VHD footer (checksum included).
+    Returns dict of fields; raises ValueError on any inconsistency."""
+    return validate_footer(footer_bytes)

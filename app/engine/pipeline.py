@@ -44,8 +44,11 @@ class Pipeline:
 
     def __init__(self, store, key_prefix, server_name, segment_size_mb=10240,
                  level=5, start_fresh=False, spool_dir=None, callbacks=None,
-                 use_vss=True, reader_factory=None):
+                 use_vss=True, reader_factory=None, merge_on_complete=False,
+                 delete_segments_after_merge=False):
         self.reader_factory = reader_factory
+        self.merge_on_complete = merge_on_complete
+        self.delete_segments_after_merge = delete_segments_after_merge
         self.store = store
         self.key_prefix = key_prefix.strip("/")
         self.server_name = server_name
@@ -126,6 +129,9 @@ class Pipeline:
 
         state = None if self.start_fresh else manifest_mod.load_state(self.server_name, vname)
         if state and state.get("status") == "done":
+            if self.merge_on_complete and not state.get("merged_key"):
+                self._merge_volume(vol, state, manifest_key, key_prefix)
+                return state
             self.log(f"{vol.letter}: already complete in saved state — skipped")
             self._cb("volume_done", f"{vol.letter}:", state)
             return state
@@ -208,6 +214,8 @@ class Pipeline:
                 self.log(f"{vol.letter}: manifest uploaded -> {manifest_key}")
             except Exception as e:
                 self.log(f"{vol.letter}: WARNING manifest upload failed: {e}")
+            if self.merge_on_complete and not state.get("merged_key"):
+                self._merge_volume(vol, state, manifest_key, key_prefix)
             self._cb("volume_done", f"{vol.letter}:", state)
             return state
 
@@ -225,7 +233,44 @@ class Pipeline:
                 except Exception as e:
                     self.log(f"{vol.letter}: WARNING snapshot delete failed: {e}")
 
-    # ---- segments ----------------------------------------------------------
+    # ---- merge -------------------------------------------------------------
+    def _merge_volume(self, vol, state, manifest_key, key_prefix):
+        """Verify segments, then compose one server-side object. Any failure
+        leaves segment objects and state untouched."""
+        from .merge import merge_segments
+        merged_key = f"{key_prefix}.full.7zcat"
+        try:
+            self._cb("status", f"{vol.letter}:", "verifying before merge…")
+            ok = verify_manifest(self.store, manifest_key, log=self.log,
+                                 cancel_event=self.cancel_event)
+            if not ok:
+                self.log(f"{vol.letter}: merge SKIPPED — verify failed")
+                return
+            self._cb("status", f"{vol.letter}:", "merging (server-side)…")
+            res = merge_segments(self.store, state["segments"], merged_key,
+                                 log=self.log, cancel_event=self.cancel_event)
+            state["merged_key"] = merged_key
+            state["merged"] = res
+            state["manifest_version"] = 2
+            manifest_mod.save_state(self.server_name, vol.safe_name(), state)
+            manifest_mod.upload_manifest(self.store, manifest_key, state)
+            self.log(f"{vol.letter}: merged -> {merged_key} "
+                     f"({res['total_size']:,} bytes, {res['parts']} part(s))")
+            if self.delete_segments_after_merge:
+                for s in state["segments"]:
+                    try:
+                        self.store.delete_object(s["key"])
+                    except Exception as e:
+                        self.log(f"  WARNING: could not delete {s['key']}: {e}")
+                state["segments_deleted"] = True
+                manifest_mod.save_state(self.server_name, vol.safe_name(), state)
+                manifest_mod.upload_manifest(self.store, manifest_key, state)
+                self.log(f"{vol.letter}: segment objects deleted "
+                         "(merged object retained)")
+        except Exception as e:
+            self.log(f"{vol.letter}: merge FAILED ({e}) — segments and state "
+                     "are untouched")
+
     def _verified_segments(self, state):
         ok = []
         for s in state.get("segments", []):

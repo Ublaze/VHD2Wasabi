@@ -41,6 +41,7 @@ def new_state(server, volume, total_size, segment_size, key_prefix):
     return {
         "tool": "VHD2Wasabi",
         "tool_version": TOOL_VERSION,
+        "manifest_version": 1,
         "server": server,
         "volume": volume,
         "total_size": total_size,      # uncompressed incl. 512-byte VHD footer

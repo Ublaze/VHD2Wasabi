@@ -84,6 +84,29 @@ class S3Store:
         r = self.client.get_object(Bucket=self.bucket, Key=key)
         return r["Body"].read()
 
+
+    def upload_part_copy(self, key, upload_id, part_no, src_key, start, length, log=None):
+        def do():
+            return self.client.upload_part_copy(
+                Bucket=self.bucket, Key=key, UploadId=upload_id, PartNumber=part_no,
+                CopySource={"Bucket": self.bucket, "Key": src_key},
+                CopySourceRange=f"bytes={start}-{start + length - 1}")
+        r = _retry(do, f"upload_part_copy {part_no}", log)
+        return r["CopyPartResult"]["ETag"].strip('"')
+
+    def get_range(self, key, start, length):
+        r = self.client.get_object(Bucket=self.bucket, Key=key,
+                                   Range=f"bytes={start}-{start + length - 1}")
+        return r["Body"].read()
+
+    def delete_object(self, key):
+        self.client.delete_object(Bucket=self.bucket, Key=key)
+
+    def open_stream(self, key):
+        """Returns (readable_stream, total_size) for a single-pass download."""
+        r = self.client.get_object(Bucket=self.bucket, Key=key)
+        return r["Body"], r["ContentLength"]
+
     def download_file(self, key, path):
         self.client.download_file(self.bucket, key, path)
 
@@ -165,6 +188,27 @@ class LocalDirStore:
     def get_bytes(self, key):
         with open(self._path(key), "rb") as f:
             return f.read()
+
+
+    def upload_part_copy(self, key, upload_id, part_no, src_key, start, length, log=None):
+        with open(self._path(src_key), "rb") as f:
+            f.seek(start)
+            data = f.read(length)
+        return self.upload_part(key, upload_id, part_no, data, log)
+
+    def get_range(self, key, start, length):
+        with open(self._path(key), "rb") as f:
+            f.seek(start)
+            return f.read(length)
+
+    def delete_object(self, key):
+        p = self._path(key)
+        if os.path.isfile(p):
+            os.remove(p)
+
+    def open_stream(self, key):
+        f = open(self._path(key), "rb")
+        return f, os.path.getsize(self._path(key))
 
     def download_file(self, key, path):
         with open(self._path(key), "rb") as f, open(path, "wb") as o:

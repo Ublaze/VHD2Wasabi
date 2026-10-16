@@ -153,6 +153,48 @@ vssadmin list shadowstorage
 vssadmin resize shadowstorage /for=C: /on=E: /maxsize=40GB
 ```
 
+## Merge on completion (server-side)
+
+With **"Merge into single object after verify"** (default ON), after a volume's
+segments are uploaded **and verified** (full download + `7za t` + re-hash), the
+tool composes ONE object per volume entirely server-side:
+`<volume-folder>/<Volume>.full.7zcat`.
+
+- The `.7zcat` format is the **plain concatenation of the segment .7z
+  archives**; the manifest records each segment's byte offset + compressed
+  size (`merged.offsets`), so restore splits the stream at exact boundaries.
+- Segments ≥ 5 MiB are added as **UploadPartCopy** parts (byte-range
+  server-side copy — no data is re-uploaded). Runs of smaller segments are
+  downloaded into memory (they're tiny) and flushed as regular parts once the
+  buffer reaches ≥ 5 MiB; no non-final part is ever < 5 MiB. If the whole
+  merged object is < 5 MiB a single `put_object` is used.
+- The manifest is bumped to `manifest_version: 2` and gains `merged_key` +
+  `merged` (offsets, total size, part count). Old fields are kept.
+- **Segment objects are kept by default** for redundancy; tick "Delete segment
+  objects after merge" to remove them once the merge completes.
+- A merge failure/abort cancels the multipart upload and leaves all segment
+  objects and state untouched.
+
+## Restore tab
+
+The **Restore** tab (uses the Capture tab's credentials): **List manifests**,
+pick one, choose a destination folder, click **Restore**.
+
+- Manifest with `merged_key`: the merged object is stream-downloaded in a
+  single pass and split into per-segment temp chunk files at the manifest's
+  byte offsets (RAM stays at a few MB; chunks live on the destination disk
+  and are deleted as consumed).
+- Otherwise the segment objects are downloaded one by one.
+- Each chunk is extracted streaming (`7za x -so`) and appended to
+  `<Volume>.vhd`; per-segment SHA-256 is verified against the manifest.
+- At the end the VHD footer checksum is validated and "footer OK" reported.
+- Progress (downloaded / extracted MB, current segment n/N) shows in the
+  status line; Cancel aborts cleanly.
+
+Manual restore still works exactly as before (download parts, `7za x` each,
+`copy /b` concatenate) — for a `.full.7zcat` object, split it at the manifest
+offsets first or just use the Restore tab.
+
 ## Limitations
 
 - **BitLocker volumes unsupported** (same as Disk2vhd — raw sector capture of
@@ -183,7 +225,9 @@ app\engine\volumereader.py volume enumeration + raw shadow device reader
 app\engine\vhdfooter.py    fixed-VHD footer (pure Python)
 app\engine\compressor.py   7-Zip segment compressor (spool)
 app\engine\uploader.py     S3/local multipart stores + concurrent tail-uploader
-app\engine\pipeline.py     orchestration: segments, resume, cancel, verify
+app\engine\pipeline.py     orchestration: segments, resume, cancel, verify, merge
+app\engine\merge.py        server-side .7zcat composition (UploadPartCopy)
+app\engine\restore.py      restore to .vhd from merged object or segments
 app\engine\manifest.py     state/manifest JSON
 app\engine\preflight.py    admin/VSS/7za/bucket/shadow-storage checks
 app\resources\7za.exe      bundled 7-Zip console

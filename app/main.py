@@ -68,8 +68,15 @@ class App(tk.Tk):
         s.configure("TProgressbar", background=ACCENT, troughcolor=BG2)
 
     def _build(self):
-        top = ttk.Frame(self, padding=8)
-        top.pack(fill="x")
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True)
+        capture = ttk.Frame(nb)
+        restore = ttk.Frame(nb)
+        nb.add(capture, text="Capture")
+        nb.add(restore, text="Restore")
+
+        top = ttk.Frame(capture, padding=8)
+        top.pack(fill="both", expand=True)
 
         vf = ttk.LabelFrame(top, text="Volumes (fixed disks) — captured sequentially, one object set per volume", padding=6)
         vf.pack(fill="x")
@@ -110,6 +117,14 @@ class App(tk.Tk):
         ttk.Checkbutton(wf, text="Start fresh (ignore saved state)",
                         variable=self.fresh_var).grid(row=2, column=2, columnspan=2,
                                                       sticky="w", padx=4)
+        self.merge_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(wf, text="Merge into single object after verify",
+                        variable=self.merge_var).grid(row=3, column=0, columnspan=3,
+                                                      sticky="w", padx=4)
+        self.del_segs_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(wf, text="Delete segment objects after merge",
+                        variable=self.del_segs_var).grid(row=3, column=3, columnspan=3,
+                                                         sticky="w", padx=4)
 
         btns = ttk.Frame(top)
         btns.pack(fill="x", pady=4)
@@ -140,6 +155,93 @@ class App(tk.Tk):
         self.logw.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         self.logw.pack(fill="both", expand=True)
+
+        self._build_restore_tab(restore)
+
+    def _build_restore_tab(self, parent):
+        top = ttk.Frame(parent, padding=8)
+        top.pack(fill="both", expand=True)
+        mf = ttk.LabelFrame(top, text="Manifest (uses Wasabi credentials from the Capture tab)", padding=6)
+        mf.pack(fill="x")
+        ttk.Button(mf, text="List manifests", command=self._restore_list).pack(anchor="w", pady=2)
+        self.restore_lb = tk.Listbox(mf, bg=BG2, fg=FG, height=8)
+        self.restore_lb.pack(fill="x", pady=2)
+        df = ttk.Frame(top)
+        df.pack(fill="x", pady=4)
+        ttk.Label(df, text="Destination folder").pack(side="left", padx=4)
+        self.dest_var = tk.StringVar(value=os.path.expanduser("~\\Desktop"))
+        ttk.Entry(df, textvariable=self.dest_var, width=50).pack(side="left", padx=4)
+        ttk.Button(df, text="Browse…", command=self._browse_dest).pack(side="left")
+        ttk.Button(df, text="Restore", command=self._restore_start).pack(side="left", padx=8)
+
+    def _browse_dest(self):
+        from tkinter import filedialog
+        d = filedialog.askdirectory()
+        if d:
+            self.dest_var.set(d)
+
+    def _restore_list(self):
+        form = self._form()
+        if not form["bucket"]:
+            messagebox.showwarning("VHD2Wasabi", "Fill in bucket and credentials (Capture tab).")
+            return
+
+        def fetch():
+            try:
+                store = self._store(form)
+                keys = manifest_mod.list_manifests(store, form["prefix"])
+                self.after(0, lambda: self._fill_restore_list(keys))
+            except Exception as e:
+                self.log(f"manifest list failed: {e}")
+        threading.Thread(target=fetch, daemon=True).start()
+
+    def _fill_restore_list(self, keys):
+        self.restore_lb.delete(0, "end")
+        for k in keys:
+            self.restore_lb.insert("end", k)
+        if not keys:
+            self.restore_lb.insert("end", "(no manifests found)")
+        self._restore_keys = keys
+
+    def _restore_start(self):
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("VHD2Wasabi", "A job is already running.")
+            return
+        sel = self.restore_lb.curselection()
+        keys = getattr(self, "_restore_keys", [])
+        if not sel or not keys:
+            messagebox.showwarning("VHD2Wasabi", "Select a manifest first.")
+            return
+        key = keys[sel[0]]
+        dest = self.dest_var.get().strip()
+        if not dest:
+            messagebox.showwarning("VHD2Wasabi", "Choose a destination folder.")
+            return
+        form = self._form()
+        store = self._store(form)
+        cancel = threading.Event()
+        self._restore_cancel = cancel
+
+        def progress(stage, dl, ex, seg_i, seg_n):
+            frac = None
+            self.q.put(("speed",
+                        f"restore: {stage} — downloaded {human(dl)}, "
+                        f"extracted {human(ex)}"
+                        + (f", segment {seg_i}/{seg_n}" if seg_i else "")))
+        def go():
+            try:
+                m = manifest_mod.download_manifest(store, key)
+                from engine import restore as restore_mod
+                res = restore_mod.restore(store, m, dest, log=self.log,
+                                          progress=progress, cancel_event=cancel)
+                self.log(f"RESTORE COMPLETE: {res['path']} ({human(res['size'])})"
+                         + (" — footer OK" if res.get("footer") else ""))
+                self.q.put(("status", "Restore complete"))
+            except Exception as e:
+                self.log(f"RESTORE FAILED: {e}")
+                self.q.put(("status", "Restore failed"))
+        self.worker = threading.Thread(target=go, daemon=True)
+        self.worker.start()
 
     # ---- helpers ------------------------------------------------------------
     def _refresh_volumes(self):
@@ -191,6 +293,8 @@ class App(tk.Tk):
         d = {k: e.get().strip() for k, e in self.entries.items()}
         d["segment_mb"] = self.seg_mb.get().strip() or "10240"
         d["level"] = self.level.get().strip() or "5"
+        d["merge"] = bool(self.merge_var.get())
+        d["delete_segments"] = bool(self.del_segs_var.get())
         return d
 
     def _save_profile(self):
@@ -212,6 +316,8 @@ class App(tk.Tk):
         self.seg_mb.insert(0, d.get("segment_mb", "10240"))
         self.level.delete(0, "end")
         self.level.insert(0, d.get("level", "5"))
+        self.merge_var.set(bool(d.get("merge", True)))
+        self.del_segs_var.set(bool(d.get("delete_segments", False)))
         self.log("Profile loaded")
 
     # ---- actions --------------------------------------------------------------
@@ -258,7 +364,9 @@ class App(tk.Tk):
         self.pipeline = pipeline_mod.Pipeline(
             store, form["prefix"], socket.gethostname(),
             segment_size_mb=seg_mb, level=level,
-            start_fresh=self.fresh_var.get(), callbacks=callbacks)
+            start_fresh=self.fresh_var.get(), callbacks=callbacks,
+            merge_on_complete=self.merge_var.get(),
+            delete_segments_after_merge=self.del_segs_var.get())
 
         def go():
             try:
@@ -288,6 +396,8 @@ class App(tk.Tk):
         self.worker.start()
 
     def _cancel(self):
+        if getattr(self, "_restore_cancel", None):
+            self._restore_cancel.set()
         if self.pipeline:
             self.pipeline.cancel()
             self.log("Cancel requested — aborting multipart, deleting snapshot…")

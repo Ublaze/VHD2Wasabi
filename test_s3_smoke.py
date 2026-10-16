@@ -20,12 +20,12 @@ SK = os.environ.get("VHD2W_TEST_SECRET_KEY", "")
 KEY = "vhd2wasabi-test/smoke.part001.7z"
 
 if not AK or not SK:
-    sys.exit("Set VHD2W_TEST_ACCESS_KEY and VHD2W_TEST_SECRET_KEY to run this test.")
+    sys.exit("VHD2W_TEST_ACCESS_KEY/SECRET_KEY not set — real S3 smoke skipped.")
 
 SIZE = 20 * 1024 * 1024  # 20 MiB -> multiple 8 MiB parts
 
 
-def main():
+def smoke_upload():
     store = S3Store(ENDPOINT, BUCKET, AK, SK, REGION)
     store.head_bucket()
     print("head_bucket ok")
@@ -81,6 +81,44 @@ def main():
         print("test objects deleted")
         shutil.rmtree(tmp, ignore_errors=True)
     print("S3 SMOKE TEST PASSED")
+
+
+def smoke_merge_env():
+    """Optional: real UploadPartCopy merge of two >=5MiB objects.
+    Only runs when VHD2W_TEST_ACCESS_KEY / VHD2W_TEST_SECRET_KEY are set."""
+    ak = os.environ.get("VHD2W_TEST_ACCESS_KEY")
+    sk = os.environ.get("VHD2W_TEST_SECRET_KEY")
+    if not ak or not sk:
+        print("merge smoke: VHD2W_TEST_* env vars not set — skipped")
+        return
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "app"))
+    from engine.merge import MIN_PART, merge_segments
+    store = S3Store(ENDPOINT, BUCKET, ak, sk, REGION)
+    store.head_bucket()
+    segs = []
+    payload = os.urandom(MIN_PART)
+    try:
+        for i in range(2):
+            key = f"vhd2wasabi-test/mseg{i}.bin"
+            store.put_bytes(key, payload)
+            segs.append({"index": i, "key": key, "compressed_size": len(payload)})
+        res = merge_segments(store, segs, "vhd2wasabi-test/merged.bin", log=print)
+        assert res["method"] == "multipart" and res["parts"] == 2
+        assert store.get_bytes("vhd2wasabi-test/merged.bin") == payload * 2
+        print("merge smoke: UploadPartCopy merge PASSED")
+    finally:
+        for k in ("vhd2wasabi-test/mseg0.bin", "vhd2wasabi-test/mseg1.bin",
+                  "vhd2wasabi-test/merged.bin"):
+            try:
+                store.client.delete_object(Bucket=BUCKET, Key=k)
+            except Exception:
+                pass
+        print("merge smoke: test objects deleted")
+
+
+def main():
+    smoke_upload()
+    smoke_merge_env()
 
 
 if __name__ == "__main__":
