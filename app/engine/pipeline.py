@@ -130,7 +130,11 @@ class Pipeline:
         state = None if self.start_fresh else manifest_mod.load_state(self.server_name, vname)
         if state and state.get("status") == "done":
             if self.merge_on_complete and not state.get("merged_key"):
-                self._merge_volume(vol, state, manifest_key, key_prefix)
+                # use the ORIGINAL key prefix from the saved state, not today's
+                # date — the segments/manifest live under the capture date
+                orig_prefix = state.get("key_prefix") or key_prefix
+                self._merge_volume(vol, state, f"{orig_prefix}.manifest.json",
+                                   orig_prefix)
                 return state
             self.log(f"{vol.letter}: already complete in saved state — skipped")
             self._cb("volume_done", f"{vol.letter}:", state)

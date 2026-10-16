@@ -164,8 +164,14 @@ tool composes ONE object per volume entirely server-side:
   archives**; the manifest records each segment's byte offset + compressed
   size (`merged.offsets`), so restore splits the stream at exact boundaries.
 - Segments ≥ 5 MiB are added as **UploadPartCopy** parts (byte-range
-  server-side copy — no data is re-uploaded). Runs of smaller segments are
-  downloaded into memory (they're tiny) and flushed as regular parts once the
+  server-side copy — no data is re-uploaded), chunked to at most
+  `COPY_PART_MAX` (default **1 GiB**) per part: Wasabi answers a copy only
+  when it finishes, and un-chunked multi-GB copies exceed client read
+  timeouts. One source segment can therefore map to several consecutive
+  parts. The S3 client uses `read_timeout=300` / `connect_timeout=30` with
+  ×3 idempotent part retries; a final failure aborts the multipart cleanly.
+- Runs of smaller segments are downloaded into memory (they're tiny) and
+  flushed as regular parts once the
   buffer reaches ≥ 5 MiB; no non-final part is ever < 5 MiB. If the whole
   merged object is < 5 MiB a single `put_object` is used.
 - The manifest is bumped to `manifest_version: 2` and gains `merged_key` +

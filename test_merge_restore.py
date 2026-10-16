@@ -187,11 +187,88 @@ def test_merge_failure(tmp):
     print("   segments intact, no partial merged object")
 
 
+def test_copy_cap(tmp):
+    print("== chunked UploadPartCopy with forced cap ==")
+    store = LocalDirStore(os.path.join(tmp, "bucket4"))
+    cap = 8 * 1024 * 1024
+    big = os.urandom(20 * 1024 * 1024)   # > 2x cap
+    small = os.urandom(1024 * 1024)
+    segs = []
+    for i, (name, data) in enumerate([("big.7z", big), ("s.7z", small)]):
+        key = f"c/{name}"
+        store.put_bytes(key, data)
+        segs.append({"index": i, "key": key, "compressed_size": len(data)})
+
+    copy_lens, put_lens = [], []
+
+    class RecStore(LocalDirStore):
+        def upload_part_copy(self, key, uid, pn, src, start, length, log=None):
+            copy_lens.append(length)
+            return super().upload_part_copy(key, uid, pn, src, start, length, log)
+
+        def upload_part(self, key, uid, pn, data, log=None):
+            put_lens.append(len(data))
+            return super().upload_part(key, uid, pn, data, log)
+
+    rec = RecStore(os.path.join(tmp, "bucket4"))
+    res = merge_segments(rec, segs, "c/full.7zcat", copy_part_max=cap,
+                         log=lambda m: print("  ", m))
+    merged = read_all(store, "c/full.7zcat")
+    assert merged == big + small, "chunked merge bytes wrong"
+    assert copy_lens == [cap, cap], f"expected 2 capped copies, got {copy_lens}"
+    all_parts = copy_lens + put_lens
+    for sz in all_parts[:-1]:
+        assert sz >= MIN_PART, f"non-final part {sz} < 5 MiB"
+    for sz in copy_lens:
+        assert sz <= cap, f"copy part {sz} exceeds cap"
+    offs = res["offsets"]
+    assert offs[0]["offset"] == 0 and offs[1]["offset"] == len(big)
+    print(f"   chunked copy OK — copies {copy_lens}, memory parts "
+          f"{[f'{x:,}' for x in put_lens]}, bytes exact")
+
+
+def test_done_unmerged_rerun(tmp):
+    print("== rerun of done-but-unmerged volume performs merge only ==")
+    src = os.path.join(tmp, "vol2.img")
+    gen_source(src)
+    store = LocalDirStore(os.path.join(tmp, "bucket5"))
+    spool = os.path.join(tmp, "spool5")
+    os.makedirs(spool)
+    manifest_mod.STATE_ROOT = os.path.join(tmp, "state5")
+    server = "OLDBOX"
+    # capture WITHOUT merge
+    p = pipeline_mod.Pipeline(
+        store, "pfx", server, segment_size_mb=64, level=5,
+        spool_dir=spool, use_vss=False,
+        reader_factory=lambda v: FileReader(src, SIZE),
+        merge_on_complete=False)
+    vol = FakeVol()
+    vol.label = "MERGEVOL"  # same safe_name as state
+    s1 = p.run_volume(vol)
+    assert s1["status"] == "done" and not s1.get("merged_key")
+    # rerun with merge ON — must not re-upload segments (reader must not even
+    # be touched) and must merge under the ORIGINAL prefix
+    def boom_reader(v):
+        raise AssertionError("reader must not be opened for done volume")
+    p2 = pipeline_mod.Pipeline(
+        store, "pfx", server, segment_size_mb=64, level=5,
+        spool_dir=spool, use_vss=False, reader_factory=boom_reader,
+        merge_on_complete=True)
+    s2 = p2.run_volume(vol)
+    assert s2.get("merged_key"), "merge did not run on done-but-unmerged rerun"
+    assert s2["merged_key"].startswith(s1["key_prefix"]), \
+        "merged object not under original key prefix"
+    assert store.head_object(s2["merged_key"])["size"] == s2["merged"]["total_size"]
+    print(f"   merge-only rerun OK -> {s2['merged_key']}")
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="vhd2w-mr-")
     try:
         test_e2e(tmp)
         test_multipart_copy(tmp)
+        test_copy_cap(tmp)
+        test_done_unmerged_rerun(tmp)
         test_merge_failure(tmp)
         print("test_merge_restore: ALL PASSED")
     finally:

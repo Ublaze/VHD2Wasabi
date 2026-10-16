@@ -15,7 +15,10 @@ Rules:
 - any failure aborts the multipart upload and leaves segment objects intact.
 """
 
-MIN_PART = 5 * 1024 * 1024  # S3 minimum part size (except final part)
+MIN_PART = 5 * 1024 * 1024      # S3 minimum part size (except final part)
+COPY_PART_MAX = 1 * 1024**3     # cap per UploadPartCopy range (1 GiB):
+# Wasabi only answers a copy when it finishes; multi-GB copies exceed client
+# read timeouts, so big segments are copied as several consecutive parts.
 
 
 class MergeError(RuntimeError):
@@ -34,7 +37,7 @@ def merge_offsets(segments):
 
 
 def merge_segments(store, segments, merged_key, log=lambda m: None,
-                   cancel_event=None):
+                   cancel_event=None, copy_part_max=COPY_PART_MAX):
     """Compose segments into one object. Returns dict with merged_key,
     total_size, offsets, parts (multipart count or 1 for put_object)."""
     if not segments:
@@ -73,29 +76,38 @@ def merge_segments(store, segments, merged_key, log=lambda m: None,
             buf.clear()
 
     try:
-        for i, s in enumerate(segments):
+        for s in segments:
             if cancel_event and cancel_event.is_set():
                 raise MergeError("merge cancelled")
             size = s["compressed_size"]
             if size >= MIN_PART:
+                start = 0
                 if buf:
                     # top the buffer up to MIN_PART from the head of this
                     # segment, flush it, then range-copy the remainder
                     need = MIN_PART - len(buf)
                     buf.extend(store.get_range(s["key"], 0, need))
                     flush_full()
-                    start, remaining = need, size - need
-                else:
-                    start, remaining = 0, size
-                if remaining >= MIN_PART or (remaining and i == len(segments) - 1 and not parts):
-                    et = store.upload_part_copy(merged_key, upload_id, part_no,
-                                                s["key"], start, remaining)
-                    parts.append((part_no, et))
-                    log(f"  merge: part {part_no} copied from "
-                        f"{s['key'].rsplit('/', 1)[-1]} ({remaining:,} bytes)")
-                    part_no += 1
-                elif remaining:
-                    buf.extend(store.get_range(s["key"], start, remaining))
+                    start = need
+                remaining = size - start
+                while remaining > 0:
+                    take = min(copy_part_max, remaining)
+                    if take < MIN_PART:
+                        # tail of this segment too small for a non-final part —
+                        # stitch it through the memory buffer instead
+                        buf.extend(store.get_range(s["key"], start, take))
+                        flush_full()
+                    else:
+                        et = store.upload_part_copy(merged_key, upload_id,
+                                                    part_no, s["key"],
+                                                    start, take)
+                        parts.append((part_no, et))
+                        log(f"  merge: part {part_no} copied from "
+                            f"{s['key'].rsplit('/', 1)[-1]} "
+                            f"({take:,} bytes @ {start:,})")
+                        part_no += 1
+                    start += take
+                    remaining -= take
             else:
                 buf.extend(store.get_bytes(s["key"]))
                 flush_full()

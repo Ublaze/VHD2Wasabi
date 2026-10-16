@@ -32,11 +32,16 @@ def _retry(fn, what, log, retries=RETRIES):
 class S3Store:
     def __init__(self, endpoint, bucket, access_key, secret_key, region="eu-central-1"):
         import boto3
+        from botocore.config import Config
+        # generous read timeout: UploadPartCopy only answers when the
+        # server-side copy finishes (multi-GB copies take minutes on Wasabi)
+        cfg = Config(read_timeout=300, connect_timeout=30,
+                     retries={"max_attempts": 4, "mode": "standard"})
         self.bucket = bucket
         self.client = boto3.client(
             "s3", endpoint_url=f"https://{endpoint}",
             aws_access_key_id=access_key, aws_secret_access_key=secret_key,
-            region_name=region,
+            region_name=region, config=cfg,
         )
 
     def head_bucket(self):
