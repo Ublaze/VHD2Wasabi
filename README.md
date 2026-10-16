@@ -45,6 +45,19 @@ its own object set — never merged, by design):
 
 ### Deviation: spool file instead of archive-to-stdout
 
+### Unreadable shadow-device tail (dd-style tolerance)
+
+Some VSS shadow devices report a length whose final sector(s) cannot actually
+be read (observed in production: last 4 KiB block unreadable, read returns
+short). Like `dd conv=sync,noerror`, the reader retries once and then
+zero-fills the remainder **only within the last 1 MiB of the device**, logging
+"tail N bytes unreadable on shadow device — zero-padded". A short read
+anywhere earlier raises a hard `ShortReadError` — silent mid-device padding
+would corrupt the image. The VHD footer is still appended after the padded
+bytes (total stream = device length + 512). Note: a resumed final segment
+re-appends the footer, so its embedded UUID/timestamp differs from the
+original attempt — harmless (the manifest is self-consistent).
+
 The plan called for `7za a -siData -so` piping compressed bytes to stdout.
 **The 7-Zip CLI does not implement `-so` for the `a` command** (returns
 "System ERROR: Not implemented" — verified with both 7za 23.01 and the full

@@ -82,6 +82,7 @@ class Pipeline:
 
     # ---- diff area monitor ----------------------------------------------
     def _diff_monitor(self, vol_letter, stop):
+        last_pct = None
         while not stop.wait(POLL_INTERVAL):
             try:
                 entries = snapshot_mod.list_shadow_storage()
@@ -95,7 +96,10 @@ class Pipeline:
                 if not used or not mx or mx <= 0:
                     continue
                 pct = used / mx
-                self._cb("diff", f"{vol_letter}:", pct)
+                pct_int = int(pct * 100)
+                if pct_int != last_pct:  # only report on change
+                    last_pct = pct_int
+                    self._cb("diff", f"{vol_letter}:", pct)
                 if pct >= DIFF_ABORT:
                     self.log(f"  DIFF AREA {pct:.0%} FULL on {vol_letter}: — aborting cleanly")
                     self.diff_abort.set()
@@ -143,7 +147,7 @@ class Pipeline:
                 mon = threading.Thread(target=self._diff_monitor, args=(vol.letter, stop_mon),
                                        daemon=True)
                 mon.start()
-                reader = VolumeReader(device)
+                reader = VolumeReader(device, log=self.log)
             raw_len = reader.length
             total_size = raw_len + 512  # + fixed VHD footer
             n_segments = (total_size + self.segment_size - 1) // self.segment_size
