@@ -201,6 +201,32 @@ Manual restore still works exactly as before (download parts, `7za x` each,
 `copy /b` concatenate) — for a `.full.7zcat` object, split it at the manifest
 offsets first or just use the Restore tab.
 
+## Moving profiles between machines
+
+The Capture tab shows a **profile saved-state indicator**: green
+"Profile '<name>' — saved" when the form matches the saved snapshot, amber
+"unsaved changes" after any edit, grey "No profile saved" on a fresh install.
+Profiles are named and stored in `%LOCALAPPDATA%\VHD2Wasabi\profiles.json`
+(legacy single-profile files are migrated to profile "default"); the last used
+profile loads automatically at startup and is shared by the Capture and
+Restore tabs.
+
+- **Export…** writes a portable `.vhd2wprofile` file (format version,
+  export timestamp, profile name + all settings: endpoint, bucket, keys,
+  prefix, segment size, compression, merge flags). Supply a password to wrap
+  it in an **AES-256, header-encrypted 7z** (built with the bundled 7za in a
+  temp dir, cleaned up afterwards). Without a password it's plain JSON — a
+  one-time warning reminds you that **the file contains your Wasabi secret
+  key**; store it securely and delete it when done.
+- **Import…** accepts `.vhd2wprofile` / `.json` / `.7z` (prompts for the
+  password when encrypted), validates required fields, asks for a profile
+  name (confirming before overwriting an existing one), saves it into
+  `profiles.json` and loads it into the form.
+
+On a fresh restore machine: install/run the EXE → **Import…** the one file →
+the Restore tab's manifest listing and restore work immediately. Secrets are
+never written to the log on export/import.
+
 ## Limitations
 
 - **BitLocker volumes unsupported** (same as Disk2vhd — raw sector capture of

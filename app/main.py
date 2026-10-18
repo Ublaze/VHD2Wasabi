@@ -86,6 +86,7 @@ class App(tk.Tk):
 
         wf = ttk.LabelFrame(top, text="Wasabi destination", padding=6)
         wf.pack(fill="x", pady=6)
+        self.vars = {}
         self.entries = {}
         fields = [
             ("endpoint", "Endpoint", "s3.eu-central-1.wasabisys.com"),
@@ -97,21 +98,19 @@ class App(tk.Tk):
         for i, (k, label, default) in enumerate(fields):
             ttk.Label(wf, text=label).grid(row=i // 3, column=(i % 3) * 2,
                                            sticky="w", padx=4, pady=2)
-            e = ttk.Entry(wf, width=28, show="*" if "key" in k and k != "access_key" else "")
-            if k == "secret_key":
-                e.config(show="*")
-            if k == "access_key":
-                e.config(show="")
-            e.insert(0, default)
+            var = tk.StringVar(value=default)
+            self.vars[k] = var
+            e = ttk.Entry(wf, width=28, textvariable=var,
+                          show="*" if k == "secret_key" else "")
             e.grid(row=i // 3, column=(i % 3) * 2 + 1, sticky="w", padx=4, pady=2)
             self.entries[k] = e
         ttk.Label(wf, text="Segment MB").grid(row=1, column=4, sticky="w", padx=4)
-        self.seg_mb = ttk.Entry(wf, width=10)
-        self.seg_mb.insert(0, "10240")
+        self.vars["segment_mb"] = tk.StringVar(value="10240")
+        self.seg_mb = ttk.Entry(wf, width=10, textvariable=self.vars["segment_mb"])
         self.seg_mb.grid(row=1, column=5, sticky="w")
         ttk.Label(wf, text="Compression (0-9)").grid(row=2, column=0, sticky="w", padx=4)
-        self.level = ttk.Entry(wf, width=10)
-        self.level.insert(0, "5")
+        self.vars["level"] = tk.StringVar(value="5")
+        self.level = ttk.Entry(wf, width=10, textvariable=self.vars["level"])
         self.level.grid(row=2, column=1, sticky="w")
         self.fresh_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(wf, text="Start fresh (ignore saved state)",
@@ -126,10 +125,25 @@ class App(tk.Tk):
                         variable=self.del_segs_var).grid(row=3, column=3, columnspan=3,
                                                          sticky="w", padx=4)
 
+        pf = ttk.Frame(top)
+        pf.pack(fill="x", pady=2)
+        ttk.Label(pf, text="Profile:").pack(side="left", padx=4)
+        self.profile_var = tk.StringVar()
+        self._profile_combos = []
+        cb = ttk.Combobox(pf, textvariable=self.profile_var, width=24)
+        cb.pack(side="left", padx=4)
+        cb.bind("<<ComboboxSelected>>", self._on_profile_selected)
+        self._profile_combos.append(cb)
+        self.profile_state_lbl = tk.Label(pf, text="No profile saved",
+                                          bg=BG, fg="#9d9d9d", anchor="w")
+        self.profile_state_lbl.pack(side="left", padx=8)
+
         btns = ttk.Frame(top)
         btns.pack(fill="x", pady=4)
         for text, cmd in [("Save profile", self._save_profile),
                           ("Load profile", self._load_profile),
+                          ("Export…", self._export_profile),
+                          ("Import…", self._import_profile),
                           ("Test connection", self._test_connection),
                           ("Start", self._start),
                           ("Verify…", self._verify_dialog),
@@ -158,9 +172,78 @@ class App(tk.Tk):
 
         self._build_restore_tab(restore)
 
+        self._saved_snapshot = None
+        self._warned_plain_export = False
+        for v in list(self.vars.values()) + [self.merge_var, self.del_segs_var]:
+            v.trace_add("write", lambda *a: self._update_profile_state())
+        self._init_profiles()
+
+    # ---- profile state ------------------------------------------------------
+    def _init_profiles(self):
+        from engine import profiles as profiles_mod
+        self.profiles_mod = profiles_mod
+        allp, last = profiles_mod.load_all()
+        self._refresh_profile_combos(allp)
+        if last and last in allp:
+            self.profile_var.set(last)
+            self._apply_profile(last, allp[last])
+        else:
+            self._update_profile_state()
+
+    def _refresh_profile_combos(self, allp=None):
+        if allp is None:
+            allp, _ = self.profiles_mod.load_all()
+        names = sorted(allp)
+        for cb in self._profile_combos:
+            cb["values"] = names
+
+    def _on_profile_selected(self, _event=None):
+        name = self.profile_var.get().strip()
+        allp, _ = self.profiles_mod.load_all()
+        if name in allp:
+            self._apply_profile(name, allp[name])
+
+    def _apply_profile(self, name, profile):
+        p = self.profiles_mod.normalize(profile)
+        for k in ("endpoint", "bucket", "access_key", "secret_key", "prefix",
+                  "segment_mb", "level"):
+            self.vars[k].set(str(p.get(k, "")))
+        self.merge_var.set(p["merge"])
+        self.del_segs_var.set(p["delete_segments"])
+        self.profile_var.set(name)
+        self._saved_snapshot = p
+        self._update_profile_state()
+
+    def _update_profile_state(self):
+        if not hasattr(self, "profile_state_lbl"):
+            return
+        name = self.profile_var.get().strip()
+        if self._saved_snapshot is None:
+            allp, _ = self.profiles_mod.load_all()
+            if not allp:
+                self.profile_state_lbl.config(text="No profile saved", fg="#9d9d9d")
+                return
+            self.profile_state_lbl.config(text="unsaved changes", fg="#d7a000")
+            return
+        current = self.profiles_mod.normalize(self._form())
+        if name and current == self._saved_snapshot:
+            self.profile_state_lbl.config(text=f"Profile '{name}' — saved",
+                                          fg="#6cc070")
+        else:
+            self.profile_state_lbl.config(text="unsaved changes", fg="#d7a000")
+
     def _build_restore_tab(self, parent):
         top = ttk.Frame(parent, padding=8)
         top.pack(fill="both", expand=True)
+        pf = ttk.Frame(top)
+        pf.pack(fill="x", pady=2)
+        ttk.Label(pf, text="Profile:").pack(side="left", padx=4)
+        cb = ttk.Combobox(pf, textvariable=self.profile_var, width=24)
+        cb.pack(side="left", padx=4)
+        cb.bind("<<ComboboxSelected>>", self._on_profile_selected)
+        self._profile_combos.append(cb)
+        ttk.Label(pf, text="(import a profile on the Capture tab — credentials "
+                           "are shared with Restore)").pack(side="left", padx=8)
         mf = ttk.LabelFrame(top, text="Manifest (uses Wasabi credentials from the Capture tab)", padding=6)
         mf.pack(fill="x")
         ttk.Button(mf, text="List manifests", command=self._restore_list).pack(anchor="w", pady=2)
@@ -290,35 +373,108 @@ class App(tk.Tk):
 
     # ---- profiles ------------------------------------------------------------
     def _form(self):
-        d = {k: e.get().strip() for k, e in self.entries.items()}
-        d["segment_mb"] = self.seg_mb.get().strip() or "10240"
-        d["level"] = self.level.get().strip() or "5"
+        d = {k: v.get().strip() for k, v in self.vars.items()}
+        d["segment_mb"] = d["segment_mb"] or "10240"
+        d["level"] = d["level"] or "5"
         d["merge"] = bool(self.merge_var.get())
         d["delete_segments"] = bool(self.del_segs_var.get())
         return d
 
     def _save_profile(self):
-        os.makedirs(APP_DIR, exist_ok=True)
-        with open(PROFILES_PATH, "w", encoding="utf-8") as f:
-            json.dump(self._form(), f, indent=2)
-        self.log(f"Profile saved to {PROFILES_PATH} (contains secrets — protect it)")
+        name = self.profile_var.get().strip() or "default"
+        try:
+            self.profiles_mod.save_profile(name, self._form())
+        except Exception as e:
+            messagebox.showerror("VHD2Wasabi", f"Save failed: {e}")
+            return
+        self.profile_var.set(name)
+        self._saved_snapshot = self.profiles_mod.normalize(self._form())
+        self._refresh_profile_combos()
+        self._update_profile_state()
+        self.log(f"Profile '{name}' saved to {self.profiles_mod.PROFILES_PATH} "
+                 "(contains secrets — protect it)")
 
     def _load_profile(self):
-        if not os.path.isfile(PROFILES_PATH):
+        name = self.profile_var.get().strip()
+        allp, _ = self.profiles_mod.load_all()
+        if not allp:
             messagebox.showinfo("VHD2Wasabi", "No saved profile found.")
             return
-        with open(PROFILES_PATH, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        for k, e in self.entries.items():
-            e.delete(0, "end")
-            e.insert(0, d.get(k, ""))
-        self.seg_mb.delete(0, "end")
-        self.seg_mb.insert(0, d.get("segment_mb", "10240"))
-        self.level.delete(0, "end")
-        self.level.insert(0, d.get("level", "5"))
-        self.merge_var.set(bool(d.get("merge", True)))
-        self.del_segs_var.set(bool(d.get("delete_segments", False)))
-        self.log("Profile loaded")
+        if name not in allp:
+            name = sorted(allp)[0]
+        self._apply_profile(name, allp[name])
+        self.log(f"Profile '{name}' loaded")
+
+    def _export_profile(self):
+        from tkinter import filedialog, simpledialog
+        name = self.profile_var.get().strip() or "default"
+        path = filedialog.asksaveasfilename(
+            defaultextension=".vhd2wprofile",
+            initialfile=f"{name}.vhd2wprofile",
+            filetypes=[("VHD2Wasabi profile", "*.vhd2wprofile"),
+                       ("JSON", "*.json"), ("7-Zip", "*.7z"), ("All files", "*.*")])
+        if not path:
+            return
+        pw = simpledialog.askstring(
+            "Export profile",
+            "Password for AES-256 encryption (leave empty for plain JSON):",
+            show="*", parent=self)
+        if pw is None:
+            return
+        try:
+            self.profiles_mod.export_profile(name, self._form(), path,
+                                             password=pw or None)
+        except Exception as e:
+            messagebox.showerror("VHD2Wasabi", f"Export failed: {e}")
+            return
+        if not pw and not self._warned_plain_export:
+            self._warned_plain_export = True
+            messagebox.showwarning(
+                "Unencrypted export",
+                "This file contains your Wasabi SECRET KEY in plain text.\n"
+                "Store it securely and delete it when no longer needed.")
+        self.log(f"Profile '{name}' exported to {path} "
+                 f"({'AES-256 encrypted' if pw else 'plain JSON'})")
+
+    def _import_profile(self):
+        from tkinter import filedialog, simpledialog
+        path = filedialog.askopenfilename(
+            filetypes=[("Profile files", "*.vhd2wprofile *.json *.7z"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        pw = None
+        if self.profiles_mod.is_7z(path):
+            pw = simpledialog.askstring("Import profile",
+                                        "Password for this encrypted profile:",
+                                        show="*", parent=self)
+            if pw is None:
+                return
+        try:
+            suggested, profile = self.profiles_mod.import_profile(path, password=pw)
+        except Exception as e:
+            messagebox.showerror("VHD2Wasabi", f"Import failed: {e}")
+            return
+        name = simpledialog.askstring("Import profile", "Save as profile name:",
+                                      initialvalue=suggested, parent=self)
+        if not name:
+            return
+        name = name.strip()
+        allp, _ = self.profiles_mod.load_all()
+        if name in allp and allp[name] != profile:
+            if not messagebox.askyesno(
+                    "VHD2Wasabi",
+                    f"Profile '{name}' already exists. Overwrite it?"):
+                return
+        try:
+            self.profiles_mod.save_profile(name, profile)
+        except Exception as e:
+            messagebox.showerror("VHD2Wasabi", f"Save failed: {e}")
+            return
+        self._refresh_profile_combos()
+        self._apply_profile(name, profile)
+        self.log(f"Profile '{name}' imported and saved — ready to use "
+                 "(Capture and Restore tabs share these credentials)")
 
     # ---- actions --------------------------------------------------------------
     def _store(self, form):
