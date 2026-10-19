@@ -78,11 +78,19 @@ class App(tk.Tk):
         top = ttk.Frame(capture, padding=8)
         top.pack(fill="both", expand=True)
 
-        vf = ttk.LabelFrame(top, text="Volumes (fixed disks) — captured sequentially, one object set per volume", padding=6)
+        vf = ttk.LabelFrame(top, text="Capture source", padding=6)
         vf.pack(fill="x")
+        self.mode_var = tk.StringVar(value="volumes")
+        mrow = ttk.Frame(vf)
+        mrow.pack(fill="x")
+        ttk.Radiobutton(mrow, text="Volumes (data)", variable=self.mode_var,
+                        value="volumes", command=self._mode_changed).pack(side="left", padx=4)
+        ttk.Radiobutton(mrow, text="Whole disk (bootable)", variable=self.mode_var,
+                        value="disk", command=self._mode_changed).pack(side="left", padx=4)
+        ttk.Button(mrow, text="Refresh", command=self._refresh_sources).pack(side="right")
         self.vol_frame = ttk.Frame(vf)
         self.vol_frame.pack(fill="x")
-        ttk.Button(vf, text="Refresh", command=self._refresh_volumes).pack(anchor="e")
+        self.disk_frame = ttk.Frame(vf)
 
         wf = ttk.LabelFrame(top, text="Wasabi destination", padding=6)
         wf.pack(fill="x", pady=6)
@@ -327,6 +335,44 @@ class App(tk.Tk):
         self.worker.start()
 
     # ---- helpers ------------------------------------------------------------
+    def _mode_changed(self):
+        if self.mode_var.get() == "disk":
+            self.vol_frame.pack_forget()
+            self.disk_frame.pack(fill="x")
+        else:
+            self.disk_frame.pack_forget()
+            self.vol_frame.pack(fill="x")
+
+    def _refresh_sources(self):
+        if self.mode_var.get() == "disk":
+            self._refresh_disks()
+        else:
+            self._refresh_volumes()
+
+    def _refresh_disks(self):
+        from engine import diskinfo
+        for w in self.disk_frame.winfo_children():
+            w.destroy()
+        self.disk_var = tk.IntVar(value=-1)
+        try:
+            self.disks = diskinfo.list_disks()
+        except Exception as e:
+            ttk.Label(self.disk_frame, text=f"Disk enumeration failed: {e}").pack(anchor="w")
+            self.disks = []
+        for d in self.disks:
+            parts = ", ".join(
+                f"{p['letter'] + ':' if p.get('letter') else 'P' + str(p['number'])}"
+                f" {p['size']/1024**3:.1f}G"
+                + (f" {p['fs']}" if p.get("fs") else "")
+                for p in d["partitions"])
+            ttk.Radiobutton(
+                self.disk_frame, variable=self.disk_var, value=d["number"],
+                text=f"Disk {d['number']}  {d['model']}   "
+                     f"{d['size']/1024**3:.1f} GiB  {d['style']}   [{parts}]"
+            ).pack(anchor="w")
+        if not self.disks:
+            ttk.Label(self.disk_frame, text="No physical disks found").pack(anchor="w")
+
     def _refresh_volumes(self):
         for w in self.vol_frame.winfo_children():
             w.destroy()
@@ -496,10 +542,18 @@ class App(tk.Tk):
         if self.worker and self.worker.is_alive():
             messagebox.showinfo("VHD2Wasabi", "A job is already running.")
             return
-        vols = self._selected()
-        if not vols:
-            messagebox.showwarning("VHD2Wasabi", "Select at least one volume.")
-            return
+        disk_mode = self.mode_var.get() == "disk"
+        if disk_mode:
+            dn = getattr(self, "disk_var", None)
+            if not dn or dn.get() < 0:
+                messagebox.showwarning("VHD2Wasabi", "Select a disk.")
+                return
+            vols = []
+        else:
+            vols = self._selected()
+            if not vols:
+                messagebox.showwarning("VHD2Wasabi", "Select at least one volume.")
+                return
         form = self._form()
         if not form["bucket"] or not form["access_key"]:
             messagebox.showwarning("VHD2Wasabi", "Fill in bucket and credentials.")
@@ -527,6 +581,22 @@ class App(tk.Tk):
         def go():
             try:
                 problems, warnings, _e = preflight.run_all(store, vols, log=self.log)
+                disk_list = []
+                if disk_mode:
+                    from engine import diskinfo
+                    dsel = self.disk_var.get()
+                    disk_list = [d for d in getattr(self, "disks", [])
+                                 if d["number"] == dsel]
+                    if not disk_list:
+                        self.log("PRE-FLIGHT FAILED: selected disk no longer present")
+                        return
+                    dprobs, dwarns = diskinfo.preflight_disk(disk_list[0])
+                    problems.extend(dprobs)
+                    warnings.extend(dwarns)
+                    d = disk_list[0]
+                    self.log(f"Disk {d['number']}: {d['model']}, "
+                             f"{d['size']/1024**3:.1f} GiB, {d['style']}, "
+                             f"{len(d['partitions'])} partition(s)")
                 for w in warnings:
                     self.log(f"WARNING: {w}")
                 if problems:
@@ -535,11 +605,18 @@ class App(tk.Tk):
                         self.log(f"  - {p}")
                     return
                 self.log("Pre-flight OK — starting capture")
-                for v in vols:
-                    st = manifest_mod.load_state(socket.gethostname(), v.safe_name())
+                if disk_mode:
+                    st = manifest_mod.load_state(socket.gethostname(),
+                                                 f"Disk{self.disk_var.get()}")
                     if st and st.get("status") != "done" and not self.fresh_var.get():
-                        self.log(f"{v.letter}: saved state found — resuming automatically")
-                self.pipeline.run_volumes(vols)
+                        self.log("saved state found — resuming automatically")
+                    self.pipeline.run_disks([self.disk_var.get()])
+                else:
+                    for v in vols:
+                        st = manifest_mod.load_state(socket.gethostname(), v.safe_name())
+                        if st and st.get("status") != "done" and not self.fresh_var.get():
+                            self.log(f"{v.letter}: saved state found — resuming automatically")
+                    self.pipeline.run_volumes(vols)
                 self.log("All done.")
                 self.q.put(("status", "Idle"))
             except pipeline_mod.Cancelled:

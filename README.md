@@ -227,6 +227,46 @@ On a fresh restore machine: install/run the EXE → **Import…** the one file �
 the Restore tab's manifest listing and restore work immediately. Secrets are
 never written to the log on export/import.
 
+## Whole disk (bootable) mode
+
+Volume-level captures contain no partition table/bootloader, so they don't
+**boot** in Hyper-V. Whole-disk mode fixes that: it captures the entire
+physical disk — partition table, EFI/MSR/Recovery/system partitions, data
+volumes, gaps — into a single bootable fixed VHD, streamed through the same
+segment → 7z → Wasabi multipart pipeline (resume, verify, merge, restore all
+work unchanged; object layout `<prefix>/<server>/<date>/Disk<N>.partNNN.7z`,
+merged `Disk<N>.full.7zcat`, manifest `Disk<N>.manifest.json`).
+
+How it works:
+
+- **Layout**: enumerated once at capture start via
+  `IOCTL_DISK_GET_DRIVE_LAYOUT_EX` (pywin32) + WMI for model/letters/
+  filesystems — Storage CIM (`Get-Disk`) is avoided; WMI failures degrade to
+  live reads with a warning rather than aborting. The frozen layout (style,
+  partitions with offsets/lengths/letters/type GUIDs) is stored in the
+  manifest (`capture_kind: "disk"`).
+- **Snapshots**: every NTFS/ReFS volume on the disk gets its own VSS
+  ClientAccessible snapshot before streaming starts; those regions are read
+  from the shadow devices. The partition table, gaps, ESP/FAT32/raw and
+  unlettered partitions are read **live** from `\\.\PhysicalDriveN` — they're
+  tiny and effectively static; a consistency note is logged listing exactly
+  which regions were read live.
+- **Resume**: per-segment as in volume mode. Snapshot IDs are not reused
+  across runs — a resumed run takes fresh snapshots and re-derives the
+  layout; if the live layout differs from the frozen one it aborts with a
+  clear message (never silently mixes layouts).
+- **Pre-flight**: blocks on dynamic (LDM) disks and BitLocker-protected
+  partitions (same limitation as Disk2vhd), warns if the disk exceeds the
+  ~2040 GiB fixed-VHD limit.
+- **Manifest** stays backward compatible: `volume` = `Disk<N>`, so the
+  Restore tab works unchanged and old v1/v2 volume manifests still restore.
+
+**Hyper-V boot notes**: the VM generation must match the source firmware —
+BIOS/MBR source → **Generation 1** VM; UEFI/GPT source → **Generation 2**
+VM (Secure Boot on). Check the source with `msinfo32` ("BIOS Mode") or
+`bcdedit`. Attach the restored `Disk<N>.vhd` as the VM's IDE (Gen 1) or SCSI
+(Gen 2) boot disk.
+
 ## Limitations
 
 - **BitLocker volumes unsupported** (same as Disk2vhd — raw sector capture of
@@ -266,4 +306,5 @@ app\resources\7za.exe      bundled 7-Zip console
 build_exe.py               PyInstaller wrapper
 test_footer.py             footer checksum/field smoke test
 test_pipeline_local.py     synthetic 200 MiB round-trip test (no S3)
+test_disk_capture.py       synthetic 300 MiB GPT disk round-trip (no S3/VSS)
 ```
