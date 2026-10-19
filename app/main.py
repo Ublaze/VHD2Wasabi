@@ -339,6 +339,7 @@ class App(tk.Tk):
         if self.mode_var.get() == "disk":
             self.vol_frame.pack_forget()
             self.disk_frame.pack(fill="x")
+            self._refresh_disks()
         else:
             self.disk_frame.pack_forget()
             self.vol_frame.pack(fill="x")
