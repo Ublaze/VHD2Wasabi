@@ -294,6 +294,8 @@ VM (Secure Boot on). Check the source with `msinfo32` ("BIOS Mode") or
 app\main.py            Tkinter UI + wiring
 app\engine\snapshot.py     VSS create/resolve/delete, shadow storage parsing
 app\engine\volumereader.py volume enumeration + raw shadow device reader
+app\engine\diskinfo.py     physical disk layout (IOCTL + WMI, with fallbacks)
+app\engine\diskreader.py   whole-disk stream assembly (shadow + live regions)
 app\engine\vhdfooter.py    fixed-VHD footer (pure Python)
 app\engine\compressor.py   7-Zip segment compressor (spool)
 app\engine\uploader.py     S3/local multipart stores + concurrent tail-uploader
