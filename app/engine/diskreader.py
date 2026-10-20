@@ -22,6 +22,103 @@ class LayoutChangedError(RuntimeError):
     pass
 
 
+class SnapshotMismatchError(RuntimeError):
+    """Shadow volume mapped to a partition whose byte length differs — a
+    wrong-source substitution must NEVER be captured silently."""
+    pass
+
+
+IOCTL_DISK_GET_LENGTH_INFO = 0x0007405C
+
+
+def _device_length(path):
+    import struct
+    h = _DeviceHandle(path)
+    try:
+        raw = win32file.DeviceIoControl(h.handle, IOCTL_DISK_GET_LENGTH_INFO,
+                                        None, 8)
+        return struct.unpack("<q", raw)[0]
+    finally:
+        h.close()
+
+
+def _snapshot_volume(path, log):
+    """Snapshot a volume by root path (letter 'C:\\' or GUID
+    '\\\\?\\Volume{...}\\'). Returns (shadow_id, device, length_bytes)."""
+    sid, device = snapshot_mod.create_snapshot(path)
+    try:
+        vlen = _device_length(device)
+    except Exception:
+        snapshot_mod.delete_snapshot(sid)
+        raise
+    return sid, device, vlen
+
+
+def assign_sources(regions, guid_volumes, physical, snapshot_fn, log,
+                   snapshot=True):
+    """Assign each region its read source. Every NTFS/ReFS partition is
+    snapshotted INDIVIDUALLY — lettered volumes by letter, unlettered ones by
+    their volume GUID path (matched by exact capacity). Hard invariant: the
+    shadow volume's byte length MUST equal the partition's byte length, else
+    SnapshotMismatchError — never substitute another source. If no snapshot
+    is possible for a partition that should have one, fall back to a live
+    read from the physical disk with a loud consistency warning.
+    Returns (snapshot_ids, shadowed_letters, live_notes)."""
+    snapshot_ids = []
+    letters = []
+    live_notes = []
+    for r in regions:
+        if r["kind"] != "partition":
+            r["source"] = "live"
+            r["device"] = physical
+            continue
+        letter = r.get("letter")
+        fs = (r.get("fs") or "").upper()
+        desc = f"partition {r['partition']} ({letter + ':' if letter else 'no letter'}, {fs or 'no fs'})"
+        if not snapshot or fs not in SNAPSHOT_FS:
+            r["source"] = "live"
+            r["device"] = physical
+            live_notes.append(desc)
+            continue
+        path = None
+        if letter:
+            path = f"{letter}:\\"
+        else:
+            # unlettered NTFS/ReFS (e.g. System Reserved) — find its volume
+            # GUID by exact capacity match and snapshot that
+            cands = [v for v in guid_volumes
+                     if not v.get("letter")
+                     and (v.get("fs") or "").upper() == fs
+                     and v.get("capacity") == r["length"]]
+            if len(cands) == 1:
+                path = cands[0]["guid_path"]
+            elif len(cands) > 1:
+                log(f"  WARNING: {desc}: {len(cands)} GUID volumes with "
+                    "matching size — cannot identify uniquely, reading live")
+        if not path:
+            r["source"] = "live"
+            r["device"] = physical
+            live_notes.append(desc + " (no snapshot possible)")
+            log(f"  WARNING: {desc} — NTFS/ReFS but could not be snapshotted "
+                "(unlettered, no GUID match); region will be read LIVE "
+                "(correct data, not crash-consistent)")
+            continue
+        sid, device, vlen = snapshot_fn(path, log)
+        if vlen != r["length"]:
+            raise SnapshotMismatchError(
+                f"{desc}: shadow volume length {vlen:,} != partition length "
+                f"{r['length']:,} — wrong-source substitution detected, "
+                "capture ABORTED")
+        snapshot_ids.append(sid)
+        if letter:
+            letters.append(letter)
+        r["source"] = "shadow"
+        r["device"] = device
+        r["snapshot_id"] = sid
+        log(f"  {desc}: snapshot {sid} ({path})")
+    return snapshot_ids, letters, live_notes
+
+
 def compute_regions(partitions, disk_length):
     """Ordered regions covering [0, disk_length): partition / gap / tail."""
     regions = []
@@ -142,8 +239,9 @@ class DiskReader:
 
 
 def build_disk_reader(disk_number, log=lambda m: None, snapshot=True,
-                      opener=None):
-    """Derive layout, snapshot NTFS/ReFS volumes, and build a DiskReader.
+                      opener=None, snapshot_fn=None):
+    """Derive layout, snapshot NTFS/ReFS volumes (lettered by letter,
+    unlettered by volume GUID), and build a DiskReader.
     Returns (reader, meta, cleanup). meta carries the frozen layout record,
     per-region sources, snapshot IDs, model, style, and shadowed letters."""
     disks = [d for d in list_disks(log=log) if d["number"] == disk_number]
@@ -153,34 +251,15 @@ def build_disk_reader(disk_number, log=lambda m: None, snapshot=True,
     regions = compute_regions(disk["partitions"], disk["size"])
     physical = f"\\\\.\\PhysicalDrive{disk_number}"
 
-    snapshot_ids = []
-    letters = []
-    live_notes = []
-    for r in regions:
-        if r["kind"] != "partition":
-            r["source"] = "live"
-            r["device"] = physical
-            continue
-        letter, fs = r.get("letter"), (r.get("fs") or "").upper()
-        if snapshot and letter and fs in SNAPSHOT_FS:
-            sid, device = snapshot_mod.create_snapshot(f"{letter}:\\")
-            snapshot_ids.append(sid)
-            letters.append(letter)
-            r["source"] = "shadow"
-            r["device"] = device
-            r["snapshot_id"] = sid
-            log(f"  disk {disk_number}: {letter}: snapshot {sid}")
-        else:
-            r["source"] = "live"
-            r["device"] = physical
-            live_notes.append(
-                f"partition {r['partition']} ({letter or 'no letter'}, "
-                f"{fs or 'no fs'}, {r['length'] / 1024**2:.0f} MiB)")
+    if snapshot_fn is None:
+        snapshot_fn = lambda path, log: _snapshot_volume(path, log)
+    snapshot_ids, letters, live_notes = assign_sources(
+        regions, disk.get("guid_volumes", []), physical, snapshot_fn, log,
+        snapshot=snapshot)
     if live_notes:
         log(f"  disk {disk_number}: read LIVE (not snapshot-consistent): "
             + "; ".join(live_notes)
-            + " — these regions are tiny/static; also the partition table "
-              "and gaps are read live")
+            + " — the partition table and gaps are also read live")
 
     # region records for the manifest (strip callables/devices internals ok)
     region_rec = [{"offset": r["offset"], "length": r["length"],

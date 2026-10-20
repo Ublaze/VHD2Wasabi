@@ -137,14 +137,29 @@ def list_disks(log=lambda m: None):
     # letter + fs per logical disk (best effort)
     part_letter = {}
     ldisks = {}
+    wmi_parts = []
+    guid_volumes = []
     try:
         for ld in _wmi("SELECT DeviceID, FileSystem FROM Win32_LogicalDisk"):
             ldisks[ld["DeviceID"].rstrip(":")] = ld
+        for p in _wmi("SELECT DiskIndex, Index, StartingOffset, Size, Type "
+                      "FROM Win32_DiskPartition"):
+            wmi_parts.append(p)
         for a in _wmi("SELECT Antecedent, Dependent FROM Win32_LogicalDiskToPartition"):
             m = re.search(r'Disk #(\d+), Partition #(\d+)', a.get("Antecedent", ""))
             l = re.search(r'"([A-Z]:)"', a.get("Dependent", ""))
             if m and l:
+                # NOTE: WMI partition index here is 0-based; IOCTL is 1-based
                 part_letter[(int(m.group(1)), int(m.group(2)))] = l.group(1)[0]
+        for v in _wmi("SELECT DeviceID, DriveLetter, FileSystem, Capacity, "
+                      "Label FROM Win32_Volume"):
+            guid_volumes.append({
+                "guid_path": v.get("DeviceID"),           # \\?\Volume{GUID}\
+                "letter": (v.get("DriveLetter") or "").rstrip(":") or None,
+                "fs": v.get("FileSystem"),
+                "capacity": int(v.get("Capacity") or 0),
+                "label": v.get("Label"),
+            })
     except Exception as e:
         log(f"WARNING: WMI volume mapping failed ({e}) — partitions will be "
             "read live (no snapshots)")
@@ -154,7 +169,17 @@ def list_disks(log=lambda m: None):
         if not size and parts:  # GET_LENGTH_INFO unavailable (non-admin probe)
             size = max(p["offset"] + p["size"] for p in parts)
         for p in parts:
-            letter = part_letter.get((idx, p["number"]))
+            # map letters by exact StartingOffset via Win32_DiskPartition —
+            # WMI partition indexes are 0-based, IOCTL PartitionNumber is
+            # 1-based; offset matching is unambiguous
+            letter = None
+            for wp in wmi_parts:
+                if wp["DiskIndex"] == idx and \
+                        int(wp.get("StartingOffset") or -1) == p["offset"]:
+                    letter = part_letter.get((idx, int(wp["Index"])))
+                    break
+            if letter is None:
+                letter = part_letter.get((idx, p["number"] - 1))
             if letter:
                 p["letter"] = letter
                 ld = ldisks.get(letter)
@@ -164,6 +189,7 @@ def list_disks(log=lambda m: None):
                       "model": models.get(idx, f"PhysicalDrive{idx}"),
                       "size": size,
                       "style": style,
+                      "guid_volumes": guid_volumes,
                       "partitions": sorted(parts, key=lambda x: x["offset"])})
     return disks
 

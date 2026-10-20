@@ -223,8 +223,83 @@ def test_layout_equality():
     print("frozen layout equality: OK")
 
 
+SR = (1 * MIB, 50 * MIB)      # System Reserved-like: NTFS, no letter
+C2 = (51 * MIB, 200 * MIB)    # C:
+TAIL2_LEN = 300 * MIB - (51 * MIB + 200 * MIB)
+PARTITIONS2 = [
+    {"number": 1, "offset": SR[0], "size": SR[1], "letter": None, "fs": "NTFS",
+     "gpt_type": None, "type": "MBR:0x27"},
+    {"number": 2, "offset": C2[0], "size": C2[1], "letter": "C", "fs": "NTFS",
+     "gpt_type": None, "type": "MBR:0x07"},
+]
+GUID_SR = "\\\\?\\Volume{sr-guid}\\"
+GUID_VOLUMES2 = [
+    {"guid_path": GUID_SR, "letter": None, "fs": "NTFS", "capacity": SR[1],
+     "label": "System Reserved"},
+    {"guid_path": "\\\\?\\Volume{c-guid}\\", "letter": "C", "fs": "NTFS",
+     "capacity": C2[1], "label": ""},
+]
+
+
+def test_two_ntfs_sources():
+    """Two NTFS partitions (one letterless): each region must come from its
+    OWN shadow — the letterless one via GUID path — and a size mismatch
+    (letter-based wrong-source substitution) must ABORT."""
+    print("== two NTFS partitions, letterless via GUID + mismatch abort ==")
+    from engine.diskreader import SnapshotMismatchError, assign_sources
+    regions = compute_regions(PARTITIONS2, 300 * MIB)
+    calls = []
+
+    def good_snapshot(path, log):
+        calls.append(path)
+        if path == "C:\\":
+            return "{SID-C}", "DEV_C", C2[1]
+        if path == GUID_SR:
+            return "{SID-SR}", "DEV_SR", SR[1]
+        raise AssertionError(f"unexpected snapshot target {path}")
+
+    sids, letters, live_notes = assign_sources(
+        regions, GUID_VOLUMES2, "PHYS", good_snapshot, print)
+    assert calls == ["C:\\", GUID_SR] or calls == [GUID_SR, "C:\\"], calls
+    by_part = {r.get("partition"): r for r in regions if r["kind"] == "partition"}
+    assert by_part[1]["source"] == "shadow" and by_part[1]["device"] == "DEV_SR"
+    assert by_part[1]["snapshot_id"] == "{SID-SR}"
+    assert by_part[2]["source"] == "shadow" and by_part[2]["device"] == "DEV_C"
+    assert letters == ["C"]
+    assert not live_notes
+    print("   each region maps to its OWN shadow (letter + GUID path): OK")
+
+    # wrong-source substitution: 'C:' shadow returned for the letterless
+    # partition (the production bug) -> length differs -> hard abort
+    regions = compute_regions(PARTITIONS2, 300 * MIB)
+
+    def buggy_snapshot(path, log):
+        # simulates the off-by-one bug: SR region gets C:'s shadow (126 GB)
+        if path == GUID_SR:
+            return "{SID-C}", "DEV_C", C2[1] * 632  # wrong length
+        return "{SID-C}", "DEV_C", C2[1]
+    try:
+        assign_sources(regions, GUID_VOLUMES2, "PHYS", buggy_snapshot, print)
+    except SnapshotMismatchError as e:
+        print(f"   size mismatch aborted as required: {str(e)[:70]}…")
+    else:
+        raise AssertionError("size mismatch must abort the capture")
+
+    # no GUID candidate -> live fallback with warning (not wrong data)
+    regions = compute_regions(PARTITIONS2, 300 * MIB)
+    warns = []
+    sids, letters, live_notes = assign_sources(
+        regions, [], "PHYS", good_snapshot, warns.append)
+    by_part = {r.get("partition"): r for r in regions if r["kind"] == "partition"}
+    assert by_part[1]["source"] == "live" and by_part[1]["device"] == "PHYS"
+    assert by_part[2]["source"] == "shadow"
+    assert any("read LIVE" in w for w in warns)
+    print("   no GUID match -> live fallback with loud warning: OK")
+
+
 def main():
     test_layout_equality()
+    test_two_ntfs_sources()
     test_reader_stream()
     tmp = tempfile.mkdtemp(prefix="vhd2w-disk-")
     try:

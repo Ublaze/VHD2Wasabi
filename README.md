@@ -246,11 +246,20 @@ How it works:
   partitions with offsets/lengths/letters/type GUIDs) is stored in the
   manifest (`capture_kind: "disk"`).
 - **Snapshots**: every NTFS/ReFS volume on the disk gets its own VSS
-  ClientAccessible snapshot before streaming starts; those regions are read
-  from the shadow devices. The partition table, gaps, ESP/FAT32/raw and
-  unlettered partitions are read **live** from `\\.\PhysicalDriveN` — they're
-  tiny and effectively static; a consistency note is logged listing exactly
-  which regions were read live.
+  ClientAccessible snapshot before streaming starts — **letterless** system
+  partitions (e.g. System Reserved) are snapshotted via their **volume GUID
+  path** (`\\?\Volume{GUID}\`, matched to the partition by exact capacity).
+  A hard invariant is enforced: the shadow volume's byte length MUST equal
+  the partition's byte length, otherwise the capture **aborts loudly** —
+  a wrong-source substitution is never written. If no snapshot is possible
+  for an unlettered NTFS/ReFS partition, that region falls back to a live
+  read with a loud consistency warning (still correct data, just not
+  crash-consistent). Partition→letter mapping is by exact StartingOffset
+  (WMI partition indexes are 0-based, IOCTL numbers are 1-based — an
+  off-by-one there once caused C:'s shadow to be mapped onto a letterless
+  system partition; the offset mapping + length invariant now make that
+  class of bug impossible). The partition table, gaps, ESP/FAT32/raw and
+  other non-snapshot regions are read **live** from `\\.\PhysicalDriveN`.
 - **Resume**: per-segment as in volume mode. Snapshot IDs are not reused
   across runs — a resumed run takes fresh snapshots and re-derives the
   layout; if the live layout differs from the frozen one it aborts with a
