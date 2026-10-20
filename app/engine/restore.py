@@ -24,14 +24,41 @@ class RestoreError(RuntimeError):
     pass
 
 
-def _safe_name(manifest):
-    vol = manifest.get("volume", "volume")
-    # "C: (LABEL)" -> LABEL else C
-    if "(" in vol and vol.endswith(")"):
-        name = vol[vol.index("(") + 1:-1]
+def _sanitize(s):
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in str(s)) \
+        or "unknown"
+
+
+def output_name(manifest):
+    """<server>_<identity>.vhd — identity is the original drive letter for
+    volume captures (fallback: label), Disk<N> for disk captures."""
+    server = _sanitize(manifest.get("server") or "unknown")
+    vol = manifest.get("volume", "")
+    if manifest.get("capture_kind") == "disk" or vol.startswith("Disk"):
+        ident = vol or "Disk"
     else:
-        name = vol.split(":")[0]
-    return "".join(c if c.isalnum() or c in "-_." else "_" for c in name) or "volume"
+        ident = manifest.get("drive_letter")
+        if not ident:
+            # backward compat: "C: (LABEL)" -> letter C; "(LABEL)" or plain
+            # -> label
+            if ":" in vol:
+                ident = vol.split(":")[0]
+            elif "(" in vol and vol.endswith(")"):
+                ident = vol[vol.index("(") + 1:-1]
+            else:
+                ident = vol or "volume"
+    return f"{server}_{_sanitize(ident)}.vhd"
+
+
+def _unique_path(dest_dir, filename):
+    """Never silently overwrite: append ' (n)' if the file exists."""
+    base, ext = os.path.splitext(filename)
+    candidate = os.path.join(dest_dir, filename)
+    n = 2
+    while os.path.exists(candidate):
+        candidate = os.path.join(dest_dir, f"{base} ({n}){ext}")
+        n += 1
+    return candidate
 
 
 def restore(store, manifest, dest_dir, log=lambda m: None,
@@ -45,7 +72,7 @@ def restore(store, manifest, dest_dir, log=lambda m: None,
     if not segments:
         raise RestoreError("manifest has no segments")
     os.makedirs(dest_dir, exist_ok=True)
-    out_path = os.path.join(dest_dir, f"{_safe_name(manifest)}.vhd")
+    out_path = _unique_path(dest_dir, output_name(manifest))
     chunk_dir = tempfile.mkdtemp(prefix=".vhd2w-chunks-", dir=dest_dir)
     n = len(segments)
     downloaded = 0
@@ -98,9 +125,8 @@ def restore(store, manifest, dest_dir, log=lambda m: None,
                     progress("downloading", downloaded, extracted, s["index"], n)
                 chunk_files.append((s, cf))
 
-        if os.path.exists(out_path):
-            os.remove(out_path)
-        with open(out_path, "ab") as out:
+        log(f"restore: writing {out_path}")
+        with open(out_path, "wb") as out:
             for i, (s, cf) in enumerate(chunk_files):
                 if cancel_event and cancel_event.is_set():
                     raise RestoreError("restore cancelled")

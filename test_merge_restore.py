@@ -121,6 +121,7 @@ def test_e2e(tmp):
         res = restore_mod.restore(store, manifest, dest,
                                   log=lambda m: print("   ", m))
         assert res["footer"], f"footer validation failed ({mode})"
+        assert os.path.basename(res["path"]) == "MERGEBOX_M.vhd", res["path"]
         with open(res["path"], "rb") as f:
             data = f.read()
         assert len(data) == SIZE + 512
@@ -262,10 +263,35 @@ def test_done_unmerged_rerun(tmp):
     print(f"   merge-only rerun OK -> {s2['merged_key']}")
 
 
+def test_output_naming(tmp):
+    print("== restore output naming + no-overwrite ==")
+    from engine.restore import _unique_path, output_name
+    m_disk = {"server": "TRX3WEB", "volume": "Disk0", "capture_kind": "disk"}
+    m_vol = {"server": "TRX3WEB", "volume": "C: (Windows)",
+             "capture_kind": "volume", "drive_letter": "C"}
+    m_vol_old = {"server": "TRX3WEB", "volume": "F: (Data)"}  # legacy manifest
+    m_label_only = {"server": "TRX3WEB", "volume": "Windows"}
+    m_bad_chars = {"server": "TR/X3:WEB", "volume": "Disk0",
+                   "capture_kind": "disk"}
+    assert output_name(m_disk) == "TRX3WEB_Disk0.vhd"
+    assert output_name(m_vol) == "TRX3WEB_C.vhd"
+    assert output_name(m_vol_old) == "TRX3WEB_F.vhd"
+    assert output_name(m_label_only) == "TRX3WEB_Windows.vhd"
+    assert "/" not in output_name(m_bad_chars) and ":" not in output_name(m_bad_chars)
+    d = os.path.join(tmp, "naming")
+    os.makedirs(d)
+    p1 = _unique_path(d, "TRX3WEB_C.vhd")
+    open(p1, "w").close()
+    p2 = _unique_path(d, "TRX3WEB_C.vhd")
+    assert p2 != p1 and "(2)" in p2 and not os.path.exists(p2)
+    print("   TRX3WEB_C.vhd / TRX3WEB_F.vhd / TRX3WEB_Disk0.vhd, collision -> ' (2)': OK")
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="vhd2w-mr-")
     try:
         test_e2e(tmp)
+        test_output_naming(tmp)
         test_multipart_copy(tmp)
         test_copy_cap(tmp)
         test_done_unmerged_rerun(tmp)

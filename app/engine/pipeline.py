@@ -161,7 +161,9 @@ class Pipeline:
                 reader = VolumeReader(device, log=self.log)
             return self._stream_segments(f"{vol.letter}:", vname, vol.letter,
                                          f"{vol.letter}: ({vname})", reader,
-                                         state, key_prefix, manifest_key)
+                                         state, key_prefix, manifest_key,
+                                         extra={"capture_kind": "volume",
+                                                "drive_letter": vol.letter})
 
         except Cancelled:
             self.log(f"{vol.letter}: cancelled — state preserved for resume")

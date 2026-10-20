@@ -194,6 +194,10 @@ pick one, choose a destination folder, click **Restore**.
 - Each chunk is extracted streaming (`7za x -so`) and appended to
   `<Volume>.vhd`; per-segment SHA-256 is verified against the manifest.
 - At the end the VHD footer checksum is validated and "footer OK" reported.
+- Output files are named `<server>_<identity>.vhd` (identity = original drive
+  letter for volume captures, `Disk<N>` for disk captures), e.g.
+  `TRX3WEB_C.vhd`, `TRX3WEB_Disk0.vhd`; existing files are never overwritten
+  (` (2)` is appended).
 - Progress (downloaded / extracted MB, current segment n/N) shows in the
   status line; Cancel aborts cleanly.
 
