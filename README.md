@@ -48,12 +48,16 @@ its own object set — never merged, by design):
 ### Unreadable shadow-device tail (dd-style tolerance)
 
 Some VSS shadow devices report a length whose final sector(s) cannot actually
-be read (observed in production: last 4 KiB block unreadable, read returns
-short). Like `dd conv=sync,noerror`, the reader retries once and then
-zero-fills the remainder **only within the last 1 MiB of the device**, logging
-"tail N bytes unreadable on shadow device — zero-padded". A short read
-anywhere earlier raises a hard `ShortReadError` — silent mid-device padding
-would corrupt the image. The VHD footer is still appended after the padded
+be read (observed in production: last 4 KiB block unreadable on bare metal;
+~2 MiB on a source disk that is itself a Hyper-V VHD with unmapped tail
+blocks). Like `dd conv=sync,noerror`, the reader retries once and then
+zero-fills the remainder **only within the last 32 MiB of the device**
+(`TAIL_PAD_MAX` in volumereader.py), logging a loud warning advising chkdsk
+on first boot if the OS volume ends inside the padded region. Padding is safe
+when the tail is unallocated space or holds only the NTFS backup boot sector.
+A short read anywhere earlier — including a gap that becomes readable again —
+raises a hard `ShortReadError`: silent mid-device padding would corrupt the
+image. The VHD footer is still appended after the padded
 bytes (total stream = device length + 512). Note: a resumed final segment
 re-appends the footer, so its embedded UUID/timestamp differs from the
 original attempt — harmless (the manifest is self-consistent).

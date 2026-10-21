@@ -9,7 +9,10 @@ import pywintypes
 
 IOCTL_DISK_GET_LENGTH_INFO = 0x0007405C
 CHUNK = 4 * 1024 * 1024  # 4 MiB aligned
-TAIL_PAD_WINDOW = 1 * 1024 * 1024  # zero-fill only allowed within last 1 MiB
+TAIL_PAD_MAX = 32 * 1024 * 1024  # zero-fill only allowed within last 32 MiB;
+# beyond that a truncated tail is almost certainly real data loss, not an
+# unmapped VHD tail (observed live: 4 KiB on bare metal, ~2 MiB on a source
+# disk that is itself a Hyper-V VHD with unmapped tail blocks)
 
 
 class ShortReadError(RuntimeError):
@@ -22,7 +25,7 @@ def tolerant_chunks(read_at, length, chunk, log=None, start=0):
     Raw devices (esp. VSS shadow devices) can report a length whose final
     sector(s) are unreadable. Like `dd conv=sync,noerror`: a short/failed
     read is retried once; if still short AND the gap lies within the last
-    TAIL_PAD_WINDOW bytes of the device, the remainder is zero-filled with a
+    TAIL_PAD_MAX bytes of the device, the remainder is zero-filled with a
     loud warning. A short read anywhere earlier is a hard ShortReadError.
     """
     pos = start
@@ -57,7 +60,7 @@ def tolerant_chunks(read_at, length, chunk, log=None, start=0):
         if short <= 0:
             continue
         # this read came back short; the gap runs from `pos` onward
-        if pos >= length - TAIL_PAD_WINDOW:
+        if pos >= length - TAIL_PAD_MAX:
             pad = length - pos
             if log:
                 log(f"WARNING: tail {pad} bytes unreadable on shadow device"

@@ -212,13 +212,41 @@ def main():
         print(f"partial resume OK — redid segment {last['index'] + 1} only, "
               "verify PASSED")
 
-        # mid-device short read must remain a hard error (no silent zero-fill)
+        # tail-pad window semantics (32 MiB): truncated tails inside the
+        # window pad; anything larger is a hard error
         from engine.volumereader import ShortReadError, tolerant_chunks
+        length = 64 * 1024 * 1024
+
+        def truncated(trunc):
+            def read_at(pos, n):
+                good = max(0, min(n, (length - trunc) - pos))
+                return b"\xAA" * good
+            return read_at
+
+        warns = []
+        got = sum(len(c) for c in tolerant_chunks(truncated(3 * 1024 * 1024),
+                                                  length, 4 * 1024 * 1024,
+                                                  warns.append))
+        assert got == length and any("zero-padded" in w for w in warns)
+        print("3 MiB truncated tail: zero-padded within 32 MiB window — OK")
+
+        try:
+            for _ in tolerant_chunks(truncated(33 * 1024 * 1024), length,
+                                     4 * 1024 * 1024):
+                pass
+        except ShortReadError:
+            print("33 MiB truncated tail: hard ShortReadError — OK")
+        else:
+            raise AssertionError("33 MiB tail must raise ShortReadError")
+
+        # mid-device short read must remain a hard error (no silent zero-fill)
         hole_at = 8 * 1024 * 1024
-        length = 32 * 1024 * 1024
 
         def holey(pos, n):
-            if pos + n > hole_at:
+            # reads touching the hole return only the readable prefix
+            if pos < hole_at <= pos + n:
+                return b"\xAA" * (hole_at - pos)
+            if hole_at <= pos < hole_at + 4 * 1024 * 1024:
                 return b""
             return b"\xAA" * n
         try:
@@ -228,6 +256,19 @@ def main():
             print("mid-device short read correctly raised ShortReadError")
         else:
             raise AssertionError("mid-device short read must raise ShortReadError")
+
+        # a gap that becomes readable again must NOT be tolerated either
+        def gap_then_ok(pos, n):
+            if hole_at <= pos < hole_at + 4 * 1024 * 1024:
+                return b""
+            return b"\xAA" * n
+        try:
+            for _ in tolerant_chunks(gap_then_ok, length, 4 * 1024 * 1024):
+                pass
+        except ShortReadError:
+            print("gap-then-readable correctly raised ShortReadError")
+        else:
+            raise AssertionError("gap-then-readable must raise ShortReadError")
 
         print("test_pipeline_local: ALL PASSED")
     finally:
