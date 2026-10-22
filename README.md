@@ -115,12 +115,34 @@ next segment (new snapshot, reader seeks to the segment offset). Completed
 volumes are skipped entirely. Resume is automatic when state exists; tick
 **Start fresh** to ignore it.
 
-### Verify
+### Verify — zero-download by default
 
-**Verify…** lists manifests in the bucket; pick one. Each segment is:
-HeadObject-checked, downloaded to a temp file, integrity-tested (`7za t`),
-then extracted streaming (`7za x -so`) and re-hashed against the manifest
-SHA-256. Per-segment PASS/FAIL is reported.
+The tool exists to capture **low-storage servers**, so verification must not
+require a full re-download. Wasabi has no server-side compute/extraction, so
+integrity is proven inline at upload time + via metadata:
+
+1. **Inline at capture**: every multipart part's MD5 is computed as it is
+   uploaded and compared to the ETag Wasabi returns for the stored part
+   (on Wasabi, part ETag == MD5 of the bytes — confirmed empirically). A
+   mismatch retries the part (×3 backoff) and then fails loudly. The
+   completed object's ETag is also checked against the recomputed multipart
+   ETag (md5 of concatenated binary part-MD5s + "-N"). Per-part MD5 + size
+   are recorded in the manifest per segment.
+2. **Metadata verify (default, instant, zero bulk download)**: per segment,
+   HeadObject size match + recomputed multipart ETag vs the stored object's
+   ETag (manifests captured before hash recording degrade to size-only with
+   a note). For merged objects: size == sum of segment sizes, plus a few-byte
+   range-GET at each segment's recorded offset to check the 7z magic
+   signature (`37 7A BC AF 27 1C`) — proving the merge assembled correctly.
+3. **Deep verify (optional)**: tick "Deep verify (downloads data)" — the
+   full download + `7za t` + streamed `7za x -so` SHA-256 path (per-segment
+   or via the merged object). Use when you want end-to-end decompression
+   proof.
+
+The **delete-segments gate** uses the metadata verify by default (deep when
+the checkbox is ticked): segments are deleted only after the merged object
+passes — manifest records `segments_deleted` / `merged_verified`; on failure
+segments are kept with a loud error.
 
 ## Restore
 
@@ -160,7 +182,8 @@ vssadmin resize shadowstorage /for=C: /on=E: /maxsize=40GB
 ## Merge on completion (server-side)
 
 With **"Merge into single object after verify"** (default ON), after a volume's
-segments are uploaded **and verified** (full download + `7za t` + re-hash), the
+segments are uploaded **and verified** (metadata verify by default — sizes +
+recomputed ETags; deep download verify when the checkbox is ticked), the
 tool composes ONE object per volume entirely server-side:
 `<volume-folder>/<Volume>.full.7zcat`.
 
@@ -185,13 +208,14 @@ tool composes ONE object per volume entirely server-side:
 - A merge failure/abort cancels the multipart upload and leaves all segment
   objects and state untouched.
 - When deletion is enabled, segment objects are deleted **only after the
-  merged object verifies end-to-end**: HeadObject size, then a full download
-  split at the manifest offsets with `7za t` + streamed SHA-256 per chunk
-  against the manifest (progress is logged; this doubles as a restorability
-  proof). The manifest records `segments_deleted`, `merged_verified` and a
-  timestamp. If verification fails, segments are kept and a loud error is
-  logged. Rerunning with the option ticked applies the gate to volumes that
-  were already merged in an earlier run.
+  merged object verifies**: by default the zero-download metadata verify
+  (size + per-segment-offset 7z magic range-GETs); with "Deep verify" ticked,
+  a full download split at the manifest offsets with `7za t` + streamed
+  SHA-256 per chunk against the manifest (progress is logged; this doubles as
+  a restorability proof). The manifest records `segments_deleted`,
+  `merged_verified` and a timestamp. If verification fails, segments are kept
+  and a loud error is logged. Rerunning with the option ticked applies the
+  gate to volumes that were already merged in an earlier run.
 
 ## Restore tab
 

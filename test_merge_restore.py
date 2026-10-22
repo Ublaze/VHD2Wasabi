@@ -305,13 +305,31 @@ def test_gated_delete(tmp):
     s1 = p1.run_volume(vol)
     assert s1.get("merged_key") and not s1.get("segments_deleted")
     # rerun with delete ON (done+merged branch — the production bug path):
-    # gate verifies merged object, then deletes
+    # gate verifies merged object, then deletes. Wrap the store to prove the
+    # gate downloads NOTHING (only tiny range-GETs for magic bytes).
+    class CountingStore(LocalDirStore):
+        bulk = 0
+
+        def download_file(self, k, p):
+            self.bulk += 1
+            return super().download_file(k, p)
+
+        def get_bytes(self, k):
+            self.bulk += 1
+            return super().get_bytes(k)
+
+        def open_stream(self, k):
+            self.bulk += 1
+            return super().open_stream(k)
+
+    cstore = CountingStore(os.path.join(tmp, "bucket6"))
     p2 = pipeline_mod.Pipeline(
-        store, "pfx", server, segment_size_mb=64, level=5, spool_dir=spool,
+        cstore, "pfx", server, segment_size_mb=64, level=5, spool_dir=spool,
         use_vss=False, reader_factory=lambda v: FileReader(src, SIZE),
         merge_on_complete=True, delete_segments_after_merge=True,
         callbacks={"log": lambda m: print("  ", m)})
     s2 = p2.run_volume(vol)
+    assert cstore.bulk == 0, f"gate downloaded bulk data ({cstore.bulk} calls)"
     assert s2.get("segments_deleted") is True, "segments not deleted after gate"
     assert s2.get("merged_verified") is True and s2.get("merged_verified_at")
     for s in s2["segments"]:
@@ -348,13 +366,10 @@ def test_gated_delete_corruption(tmp):
         use_vss=False, reader_factory=lambda v: FileReader(src, SIZE),
         merge_on_complete=True, delete_segments_after_merge=False)
     s1 = p1.run_volume(vol)
-    # corrupt the merged object: flip bytes inside the first chunk's range
+    # metadata-detectable corruption: truncate the merged object
     mpath = store._path(s1["merged_key"])
     with open(mpath, "r+b") as f:
-        f.seek(100)
-        b = f.read(1)
-        f.seek(100)
-        f.write(bytes([b[0] ^ 0xFF]))
+        f.truncate(os.path.getsize(mpath) - 100)
     p2 = pipeline_mod.Pipeline(
         store, "pfx", server, segment_size_mb=64, level=5, spool_dir=spool,
         use_vss=False, reader_factory=lambda v: FileReader(src, SIZE),
@@ -365,7 +380,87 @@ def test_gated_delete_corruption(tmp):
     assert not s2.get("merged_verified")
     for s in s2["segments"]:
         assert store.head_object(s["key"]), "segment wrongly deleted"
-    print("   corruption detected, all segment objects retained")
+    print("   truncated merged object: metadata gate held, segments retained")
+
+    # interior corruption (size/magic intact) is caught by DEEP verify only
+    store2 = LocalDirStore(os.path.join(tmp, "bucket7b"))
+    spool2 = os.path.join(tmp, "spool7b")
+    os.makedirs(spool2)
+    manifest_mod.STATE_ROOT = os.path.join(tmp, "state7b")
+    p3 = pipeline_mod.Pipeline(
+        store2, "pfx", server, segment_size_mb=64, level=5, spool_dir=spool2,
+        use_vss=False, reader_factory=lambda v: FileReader(src, SIZE),
+        merge_on_complete=True, delete_segments_after_merge=False)
+    s3 = p3.run_volume(vol)
+    mpath2 = store2._path(s3["merged_key"])
+    with open(mpath2, "r+b") as f:
+        f.seek(100)
+        b = f.read(1)
+        f.seek(100)
+        f.write(bytes([b[0] ^ 0xFF]))
+    mkey = [k for k in store2.list_keys("pfx", suffix=".manifest.json")][0]
+    ok_meta = pipeline_mod.verify_manifest(store2, mkey, log=lambda m: None)
+    assert ok_meta, "metadata verify should pass (interior byte not visible)"
+    ok_deep = pipeline_mod.verify_manifest(store2, mkey, deep=True,
+                                           log=lambda m: None)
+    assert not ok_deep, "deep verify must catch interior corruption"
+    print("   interior byte flip: metadata passes (by design), deep verify "
+          "catches it")
+
+
+def test_inline_part_hash(tmp):
+    print("== inline per-part MD5-vs-ETag check fails loudly on corruption ==")
+    src = os.path.join(tmp, "vol5.img")
+    gen_source(src)
+
+    class CorruptAtRest(LocalDirStore):
+        """Stores a corrupted copy but honestly reports MD5 of what it
+        stored — exactly what the client-side ETag check exists to catch."""
+        def upload_part(self, key, uid, pn, data, log=None):
+            bad = bytes([data[0] ^ 0xFF]) + data[1:]
+            return super().upload_part(key, uid, pn, bad, log)
+
+    store = CorruptAtRest(os.path.join(tmp, "bucket8"))
+    spool = os.path.join(tmp, "spool8")
+    os.makedirs(spool)
+    manifest_mod.STATE_ROOT = os.path.join(tmp, "state8")
+    p = pipeline_mod.Pipeline(
+        store, "pfx", "BADBOX", segment_size_mb=64, level=5, spool_dir=spool,
+        use_vss=False, reader_factory=lambda v: FileReader(src, SIZE),
+        callbacks={"log": lambda m: None})
+    try:
+        p.run_volume(FakeVol())
+    except Exception as e:
+        assert "ETag" in str(e) or "MD5" in str(e), str(e)
+        print(f"   corruption caught at upload: {str(e)[:80]}")
+        return
+    raise AssertionError("corrupt-at-rest upload must fail loudly")
+
+
+def test_magic_shift_detection(tmp):
+    print("== merged-object magic check detects shifted content ==")
+    src = os.path.join(tmp, "vol6.img")
+    gen_source(src)
+    store = LocalDirStore(os.path.join(tmp, "bucket9"))
+    spool = os.path.join(tmp, "spool9")
+    os.makedirs(spool)
+    manifest_mod.STATE_ROOT = os.path.join(tmp, "state9")
+    p = pipeline_mod.Pipeline(
+        store, "pfx", "MAGICBOX", segment_size_mb=64, level=5, spool_dir=spool,
+        use_vss=False, reader_factory=lambda v: FileReader(src, SIZE),
+        merge_on_complete=True)
+    s = p.run_volume(FakeVol())
+    mkey = [k for k in store.list_keys("pfx", suffix=".manifest.json")][0]
+    assert pipeline_mod.verify_manifest(store, mkey, log=lambda m: None)
+    # shift merged content: overwrite segment-2 offset region (magic gone)
+    mpath = store._path(s["merged_key"])
+    off2 = s["merged"]["offsets"][1]["offset"]
+    with open(mpath, "r+b") as f:
+        f.seek(off2)
+        f.write(b"\x00" * 6)
+    ok = pipeline_mod.verify_manifest(store, mkey, log=lambda m: print("  ", m))
+    assert not ok, "shifted/corrupted merged content must fail magic check"
+    print("   corrupted segment boundary detected by magic check: OK")
 
 
 def main():
@@ -378,6 +473,8 @@ def main():
         test_done_unmerged_rerun(tmp)
         test_gated_delete(tmp)
         test_gated_delete_corruption(tmp)
+        test_inline_part_hash(tmp)
+        test_magic_shift_detection(tmp)
         test_merge_failure(tmp)
         print("test_merge_restore: ALL PASSED")
     finally:

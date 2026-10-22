@@ -132,6 +132,12 @@ class App(tk.Tk):
         ttk.Checkbutton(wf, text="Delete segment objects after merge",
                         variable=self.del_segs_var).grid(row=3, column=3, columnspan=3,
                                                          sticky="w", padx=4)
+        self.deep_verify_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(wf, text="Deep verify (downloads data — default verify "
+                                 "is instant, metadata-only)",
+                        variable=self.deep_verify_var).grid(row=4, column=0,
+                                                            columnspan=6,
+                                                            sticky="w", padx=4)
 
         pf = ttk.Frame(top)
         pf.pack(fill="x", pady=2)
@@ -577,7 +583,8 @@ class App(tk.Tk):
             segment_size_mb=seg_mb, level=level,
             start_fresh=self.fresh_var.get(), callbacks=callbacks,
             merge_on_complete=self.merge_var.get(),
-            delete_segments_after_merge=self.del_segs_var.get())
+            delete_segments_after_merge=self.del_segs_var.get(),
+            deep_verify=self.deep_verify_var.get())
 
         def go():
             try:
@@ -711,7 +718,8 @@ class App(tk.Tk):
         def go():
             try:
                 ok = pipeline_mod.verify_manifest(store, key, log=self.log,
-                                                  cancel_event=cancel)
+                                                  cancel_event=cancel,
+                                                  deep=self.deep_verify_var.get())
                 self.q.put(("status", "Verify PASSED" if ok else "Verify FAILED"))
             except Exception as e:
                 self.log(f"verify error: {e}")

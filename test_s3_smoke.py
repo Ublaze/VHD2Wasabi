@@ -116,8 +116,40 @@ def smoke_merge_env():
         print("merge smoke: test objects deleted")
 
 
+def smoke_etag_semantics(store):
+    """Empirical: Wasabi ETag of an UploadPart == MD5 of the part bytes, and
+    the completed object's ETag == md5(concat(binary part MD5s)) + '-N'."""
+    from engine.uploader import recompute_multipart_etag
+    key = "vhd2wasabi-test/etag-check.bin"
+    uid = store.initiate(key)
+    parts, md5s = [], []
+    try:
+        for i in range(2):
+            data = os.urandom(5 * 1024 * 1024 + i)
+            et = store.upload_part(key, uid, i + 1, data)
+            md5 = hashlib.md5(data).hexdigest()
+            assert et == md5, f"part ETag {et} != MD5 {md5}"
+            parts.append((i + 1, et))
+            md5s.append(md5)
+        full = store.complete(key, uid, parts)
+        expect = recompute_multipart_etag(md5s)
+        assert full == expect, f"complete ETag {full} != recomputed {expect}"
+        head = store.head_object(key)
+        assert head["etag"] == expect
+        print("etag semantics: part ETag == MD5, complete ETag == "
+              "multipart formula — CONFIRMED on Wasabi")
+    finally:
+        try:
+            store.abort(key, uid)
+        except Exception:
+            pass
+        store.client.delete_object(Bucket=BUCKET, Key=key)
+
+
 def main():
     smoke_upload()
+    store = S3Store(ENDPOINT, BUCKET, AK, SK, REGION)
+    smoke_etag_semantics(store)
     smoke_merge_env()
 
 

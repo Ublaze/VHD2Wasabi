@@ -45,9 +45,11 @@ class Pipeline:
     def __init__(self, store, key_prefix, server_name, segment_size_mb=10240,
                  level=5, start_fresh=False, spool_dir=None, callbacks=None,
                  use_vss=True, reader_factory=None, merge_on_complete=False,
-                 delete_segments_after_merge=False, disk_reader_factory=None):
+                 delete_segments_after_merge=False, disk_reader_factory=None,
+                 deep_verify=False):
         self.reader_factory = reader_factory
         self.disk_reader_factory = disk_reader_factory
+        self.deep_verify = deep_verify
         self.merge_on_complete = merge_on_complete
         self.delete_segments_after_merge = delete_segments_after_merge
         self.store = store
@@ -347,7 +349,8 @@ class Pipeline:
         try:
             self._cb("status", f"{display}:", "verifying before merge…")
             ok = verify_manifest(self.store, manifest_key, log=self.log,
-                                 cancel_event=self.cancel_event)
+                                 cancel_event=self.cancel_event,
+                                 deep=self.deep_verify)
             if not ok:
                 self.log(f"{display}: merge SKIPPED — verify failed")
                 return
@@ -375,10 +378,16 @@ class Pipeline:
             return
         self._cb("status", f"{display}:",
                  "verifying merged object before deleting segments…")
-        self.log(f"{display}: verifying merged object end-to-end before "
-                 "deletion (downloads it once)")
-        ok = verify_merged(self.store, state, log=self.log,
-                           cancel_event=self.cancel_event)
+        if self.deep_verify:
+            self.log(f"{display}: DEEP verify of merged object before "
+                     "deletion (downloads it once)")
+            ok = verify_merged(self.store, state, log=self.log,
+                               cancel_event=self.cancel_event)
+        else:
+            self.log(f"{display}: metadata verify of merged object before "
+                     "deletion (no download)")
+            ok = verify_meta(self.store, state, log=self.log,
+                             cancel_event=self.cancel_event)
         if not ok:
             self.log(f"{display}: MERGED VERIFICATION FAILED — segment "
                      "objects KEPT (nothing deleted)")
@@ -474,6 +483,7 @@ class Pipeline:
                 "raw_sha256": hasher.hexdigest(),
                 "compressed_size": compressed_size,
                 "etag": etag,
+                "parts": up.part_details,
                 "status": "complete",
             }
         except Exception:
@@ -498,6 +508,73 @@ class Pipeline:
 
 
 # ---- verify ---------------------------------------------------------------
+SEVENZ_MAGIC = b"7z\xbc\xaf\x27\x1c"
+
+
+def verify_meta(store, manifest, log=print, cancel_event=None):
+    """ZERO-DOWNLOAD verification: HeadObject size + multipart-ETag recompute
+    from the manifest's recorded part MD5s (old manifests without part hashes
+    degrade to size-only with a note). Merged objects additionally get a
+    range-GET of a few bytes at each segment offset to check the 7z magic —
+    proving the merge assembled correctly. Bulk data is never downloaded."""
+    from .uploader import recompute_multipart_etag
+    all_ok = True
+
+    def check(ok, msg):
+        nonlocal all_ok
+        all_ok = all_ok and ok
+        log(f"  {'PASS' if ok else 'FAIL'} — {msg}")
+
+    segs_deleted = bool(manifest.get("segments_deleted"))
+    if segs_deleted:
+        log("  segment objects were deleted after merge — verifying merged "
+            "object only")
+    for seg in manifest.get("segments", []):
+        if cancel_event and cancel_event.is_set():
+            log("verify cancelled")
+            return False
+        if segs_deleted:
+            break
+        head = store.head_object(seg["key"])
+        label = seg["key"].rsplit("/", 1)[-1]
+        if not head:
+            check(False, f"{label}: object missing")
+            continue
+        if head["size"] != seg["compressed_size"]:
+            check(False, f"{label}: size {head['size']:,} != manifest "
+                         f"{seg['compressed_size']:,}")
+            continue
+        parts = seg.get("parts")
+        if parts:
+            recomputed = recompute_multipart_etag([p["md5"] for p in parts])
+            check(head["etag"] == recomputed,
+                  f"{label}: size ok, ETag recompute "
+                  f"{'matches' if head['etag'] == recomputed else 'MISMATCH ' + head['etag'] + ' vs ' + recomputed}")
+        else:
+            check(True, f"{label}: size ok (no part hashes recorded — "
+                        "size-only, captured before hash recording)")
+    merged_key = manifest.get("merged_key")
+    if merged_key:
+        head = store.head_object(merged_key)
+        expect = manifest.get("merged", {}).get("total_size")
+        if not head:
+            check(False, f"merged object {merged_key} missing")
+        else:
+            check(expect is None or head["size"] == expect,
+                  f"merged size {head['size']:,}"
+                  + (f" == manifest {expect:,}" if head["size"] == expect
+                     else f" != manifest {expect:,}"))
+            if head["size"] == expect or expect is None:
+                for o in manifest.get("merged", {}).get("offsets", []):
+                    magic = store.get_range(merged_key, o["offset"], 6)
+                    check(magic == SEVENZ_MAGIC,
+                          f"merged offset {o['offset']:,} (segment "
+                          f"{o['index'] + 1}): 7z magic "
+                          f"{'ok' if magic == SEVENZ_MAGIC else 'MISSING'}")
+    log(f"metadata verify {'PASSED' if all_ok else 'FAILED'}")
+    return all_ok
+
+
 def verify_merged(store, manifest, log=print, cancel_event=None,
                   progress=None):
     """Verify the MERGED object end-to-end: HeadObject size, stream-download
@@ -543,20 +620,25 @@ def verify_merged(store, manifest, log=print, cancel_event=None,
 
 
 def verify_manifest(store, manifest_key, log=print, result_cb=None,
-                    cancel_event=None, use_merged=None):
-    """Verify a manifest: via the merged object when it has one (default),
-    else per-segment HeadObject + download + `7za t` + streamed hash."""
+                    cancel_event=None, use_merged=None, deep=False):
+    """Verify a manifest. Default (deep=False): ZERO-DOWNLOAD metadata verify
+    (sizes + recomputed multipart ETags + merged-object magic bytes). With
+    deep=True: full download — merged object when present (else per-segment),
+    `7za t` + streamed SHA-256 per chunk."""
     m = manifest_mod.download_manifest(store, manifest_key)
+    if not deep:
+        log(f"Verifying {manifest_key} (metadata-only, no download)")
+        return verify_meta(store, m, log=log, cancel_event=cancel_event)
     if use_merged is None:
         use_merged = bool(m.get("merged_key"))
     if use_merged:
         if not m.get("merged_key"):
             log("no merged object in manifest — falling back to per-segment")
         else:
-            log(f"Verifying {manifest_key} via MERGED object "
+            log(f"Verifying {manifest_key} via MERGED object (deep) "
                 f"{m['merged_key']}")
             return verify_merged(store, m, log=log, cancel_event=cancel_event)
-    log(f"Verifying {manifest_key} (per-segment)")
+    log(f"Verifying {manifest_key} (per-segment, deep)")
     log(f"  server={m.get('server')} volume={m.get('volume')} "
         f"size={m.get('total_size'):,} segments={len(m.get('segments', []))}")
     sevenzip = find_sevenzip()

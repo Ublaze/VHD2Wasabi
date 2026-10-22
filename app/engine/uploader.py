@@ -29,6 +29,24 @@ def _retry(fn, what, log, retries=RETRIES):
             delay *= 2
 
 
+def recompute_multipart_etag(part_md5_hexes):
+    """Standard S3 multipart ETag: md5(concat(binary part MD5s)) + '-N'."""
+    digest = hashlib.md5(
+        b"".join(bytes.fromhex(m) for m in part_md5_hexes)).hexdigest()
+    return f"{digest}-{len(part_md5_hexes)}"
+
+
+def check_part_etag(data, etag, what="part"):
+    """Wasabi/S3 ETag of a stored part == MD5 hex of the bytes. A mismatch
+    means corruption in transit or at rest — raise so the caller retries."""
+    md5 = hashlib.md5(data).hexdigest()
+    if etag and etag != md5:
+        raise UploadError(
+            f"{what}: ETag {etag} != computed MD5 {md5} — corrupted "
+            "in transit or at rest")
+    return md5
+
+
 class S3Store:
     def __init__(self, endpoint, bucket, access_key, secret_key, region="eu-central-1"):
         import boto3
@@ -83,7 +101,8 @@ class S3Store:
             return None
 
     def put_bytes(self, key, data):
-        self.client.put_object(Bucket=self.bucket, Key=key, Body=data)
+        r = self.client.put_object(Bucket=self.bucket, Key=key, Body=data)
+        check_part_etag(data, r["ETag"].strip('"'), f"put_object {key}")
 
     def get_bytes(self, key):
         r = self.client.get_object(Bucket=self.bucket, Key=key)
@@ -171,6 +190,8 @@ class LocalDirStore:
             os.remove(os.path.join(d, fn))
         os.rmdir(d)
         et = hashlib.md5(b"".join(md5s)).hexdigest() + f"-{len(parts)}"
+        with open(self._path(key) + ".etag", "w") as f:
+            f.write(et)
         return et
 
     def abort(self, key, upload_id):
@@ -184,11 +205,18 @@ class LocalDirStore:
         p = self._path(key)
         if not os.path.isfile(p):
             return None
-        return {"size": os.path.getsize(p), "etag": ""}
+        et = ""
+        ep = p + ".etag"
+        if os.path.isfile(ep):
+            with open(ep) as f:
+                et = f.read().strip()
+        return {"size": os.path.getsize(p), "etag": et}
 
     def put_bytes(self, key, data):
         with open(self._path(key), "wb") as f:
             f.write(data)
+        with open(self._path(key) + ".etag", "w") as f:
+            f.write(hashlib.md5(data).hexdigest())
 
     def get_bytes(self, key):
         with open(self._path(key), "rb") as f:
@@ -210,6 +238,8 @@ class LocalDirStore:
         p = self._path(key)
         if os.path.isfile(p):
             os.remove(p)
+        if os.path.isfile(p + ".etag"):
+            os.remove(p + ".etag")
 
     def open_stream(self, key):
         f = open(self._path(key), "rb")
@@ -230,6 +260,8 @@ class LocalDirStore:
             for fn in fns:
                 full = os.path.join(dp, fn)
                 rel = os.path.relpath(full, self.root).replace(os.sep, "/")
+                if rel.endswith(".etag"):
+                    continue
                 if rel.startswith(prefix) and (suffix is None or rel.endswith(suffix)):
                     keys.append(rel)
         return keys
@@ -248,6 +280,7 @@ class TailUploader(threading.Thread):
         self.log = log or (lambda m: None)
         self.cancel_event = cancel_event or threading.Event()
         self.parts = []
+        self.part_details = []  # {"n", "etag", "md5", "size"} — recorded in manifest
         self.uploaded_bytes = 0
         self.etag = None
         self.error = None
@@ -291,6 +324,14 @@ class TailUploader(threading.Thread):
             if not self.cancel_event.is_set():
                 self.etag = self.store.complete(self.key, self._upload_id,
                                                 self.parts, self.log)
+                # completed-object ETag must equal the recomputed multipart
+                # ETag from the recorded part MD5s
+                recomputed = recompute_multipart_etag(
+                    [d["md5"] for d in self.part_details])
+                if self.etag and self.etag != recomputed:
+                    raise UploadError(
+                        f"completed ETag {self.etag} != recomputed "
+                        f"{recomputed} from part MD5s")
         except Exception as e:
             self.error = e
             self.log(f"  uploader error: {e}")
@@ -305,8 +346,20 @@ class TailUploader(threading.Thread):
             return 0
 
     def _send(self, part_no, data):
-        et = self.store.upload_part(self.key, self._upload_id, part_no, data, self.log)
+        md5 = hashlib.md5(data).hexdigest()
+
+        def do():
+            et = self.store.upload_part(self.key, self._upload_id, part_no,
+                                        data, self.log)
+            if et != md5:
+                raise UploadError(
+                    f"part {part_no}: ETag {et} != computed MD5 {md5} — "
+                    "corrupted in transit or at rest")
+            return et
+        et = _retry(do, f"part {part_no} upload+etag-check", self.log)
         self.parts.append((part_no, et))
+        self.part_details.append({"n": part_no, "etag": et, "md5": md5,
+                                  "size": len(data)})
         self.uploaded_bytes += len(data)
 
     def writer_done(self):

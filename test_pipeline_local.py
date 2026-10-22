@@ -169,10 +169,13 @@ def main():
         print(f"reassembled {total_extracted:,} bytes — device hash MATCHES "
               f"(tail zero-padded), footer valid")
 
-        # verify mode (7za t + streamed re-hash per segment)
+        # verify modes: metadata-only (default, zero-download) AND deep
+        # (7za t + streamed re-hash per segment)
         mkey = [k for k in store.list_keys("testprefix", suffix=".manifest.json")][0]
         ok = pipeline_mod.verify_manifest(store, mkey)
-        assert ok, "verify_manifest failed"
+        assert ok, "metadata verify_manifest failed"
+        ok = pipeline_mod.verify_manifest(store, mkey, deep=True)
+        assert ok, "deep verify_manifest failed"
 
         # resume semantics: completed volume is skipped on a second run
         p2 = pipeline_mod.Pipeline(
@@ -207,8 +210,8 @@ def main():
         assert state3["segments"][-1]["raw_size"] == segs[-1]["raw_size"]
         ok = pipeline_mod.verify_manifest(
             store, [k for k in store.list_keys("testprefix", suffix=".manifest.json")][0],
-            log=lambda m: None)
-        assert ok, "verify after partial resume failed"
+            log=lambda m: None, deep=True)
+        assert ok, "deep verify after partial resume failed"
         print(f"partial resume OK — redid segment {last['index'] + 1} only, "
               "verify PASSED")
 
