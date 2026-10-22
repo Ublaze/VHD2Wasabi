@@ -184,6 +184,14 @@ tool composes ONE object per volume entirely server-side:
   objects after merge" to remove them once the merge completes.
 - A merge failure/abort cancels the multipart upload and leaves all segment
   objects and state untouched.
+- When deletion is enabled, segment objects are deleted **only after the
+  merged object verifies end-to-end**: HeadObject size, then a full download
+  split at the manifest offsets with `7za t` + streamed SHA-256 per chunk
+  against the manifest (progress is logged; this doubles as a restorability
+  proof). The manifest records `segments_deleted`, `merged_verified` and a
+  timestamp. If verification fails, segments are kept and a loud error is
+  logged. Rerunning with the option ticked applies the gate to volumes that
+  were already merged in an earlier run.
 
 ## Restore tab
 

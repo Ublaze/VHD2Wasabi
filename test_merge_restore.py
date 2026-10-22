@@ -287,6 +287,87 @@ def test_output_naming(tmp):
     print("   TRX3WEB_C.vhd / TRX3WEB_F.vhd / TRX3WEB_Disk0.vhd, collision -> ' (2)': OK")
 
 
+def test_gated_delete(tmp):
+    print("== gate-verified delete after merge ==")
+    src = os.path.join(tmp, "vol3.img")
+    gen_source(src)
+    store = LocalDirStore(os.path.join(tmp, "bucket6"))
+    spool = os.path.join(tmp, "spool6")
+    os.makedirs(spool)
+    manifest_mod.STATE_ROOT = os.path.join(tmp, "state6")
+    server = "GATEBOX"
+    vol = FakeVol()
+    # capture + merge, delete OFF
+    p1 = pipeline_mod.Pipeline(
+        store, "pfx", server, segment_size_mb=64, level=5, spool_dir=spool,
+        use_vss=False, reader_factory=lambda v: FileReader(src, SIZE),
+        merge_on_complete=True, delete_segments_after_merge=False)
+    s1 = p1.run_volume(vol)
+    assert s1.get("merged_key") and not s1.get("segments_deleted")
+    # rerun with delete ON (done+merged branch — the production bug path):
+    # gate verifies merged object, then deletes
+    p2 = pipeline_mod.Pipeline(
+        store, "pfx", server, segment_size_mb=64, level=5, spool_dir=spool,
+        use_vss=False, reader_factory=lambda v: FileReader(src, SIZE),
+        merge_on_complete=True, delete_segments_after_merge=True,
+        callbacks={"log": lambda m: print("  ", m)})
+    s2 = p2.run_volume(vol)
+    assert s2.get("segments_deleted") is True, "segments not deleted after gate"
+    assert s2.get("merged_verified") is True and s2.get("merged_verified_at")
+    for s in s2["segments"]:
+        assert store.head_object(s["key"]) is None, f"{s['key']} still present"
+    assert store.head_object(s2["merged_key"]), "merged object missing"
+    # manifest in the bucket carries the flags too
+    mkey = [k for k in store.list_keys("pfx", suffix=".manifest.json")][0]
+    m = manifest_mod.download_manifest(store, mkey)
+    assert m.get("segments_deleted") and m.get("merged_verified")
+    # restore from merged still passes after deletion
+    res = restore_mod.restore(store, m, os.path.join(tmp, "restore-gated"))
+    assert res["footer"], "restore-from-merged failed after segment deletion"
+    assert os.path.basename(res["path"]) == "GATEBOX_M.vhd"
+    print(f"   segments deleted, merged verified, restore OK -> "
+          f"{os.path.basename(res['path'])}")
+
+    # Verify button path now uses the merged object
+    ok = pipeline_mod.verify_manifest(store, mkey, log=lambda m: None)
+    assert ok, "verify via merged object failed"
+
+
+def test_gated_delete_corruption(tmp):
+    print("== corrupted merged object -> deletion skipped, segments kept ==")
+    src = os.path.join(tmp, "vol4.img")
+    gen_source(src)
+    store = LocalDirStore(os.path.join(tmp, "bucket7"))
+    spool = os.path.join(tmp, "spool7")
+    os.makedirs(spool)
+    manifest_mod.STATE_ROOT = os.path.join(tmp, "state7")
+    server = "CORRUPTBOX"
+    vol = FakeVol()
+    p1 = pipeline_mod.Pipeline(
+        store, "pfx", server, segment_size_mb=64, level=5, spool_dir=spool,
+        use_vss=False, reader_factory=lambda v: FileReader(src, SIZE),
+        merge_on_complete=True, delete_segments_after_merge=False)
+    s1 = p1.run_volume(vol)
+    # corrupt the merged object: flip bytes inside the first chunk's range
+    mpath = store._path(s1["merged_key"])
+    with open(mpath, "r+b") as f:
+        f.seek(100)
+        b = f.read(1)
+        f.seek(100)
+        f.write(bytes([b[0] ^ 0xFF]))
+    p2 = pipeline_mod.Pipeline(
+        store, "pfx", server, segment_size_mb=64, level=5, spool_dir=spool,
+        use_vss=False, reader_factory=lambda v: FileReader(src, SIZE),
+        merge_on_complete=True, delete_segments_after_merge=True,
+        callbacks={"log": lambda m: print("  ", m)})
+    s2 = p2.run_volume(vol)
+    assert not s2.get("segments_deleted"), "deletion happened despite corruption"
+    assert not s2.get("merged_verified")
+    for s in s2["segments"]:
+        assert store.head_object(s["key"]), "segment wrongly deleted"
+    print("   corruption detected, all segment objects retained")
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="vhd2w-mr-")
     try:
@@ -295,6 +376,8 @@ def main():
         test_multipart_copy(tmp)
         test_copy_cap(tmp)
         test_done_unmerged_rerun(tmp)
+        test_gated_delete(tmp)
+        test_gated_delete_corruption(tmp)
         test_merge_failure(tmp)
         print("test_merge_restore: ALL PASSED")
     finally:

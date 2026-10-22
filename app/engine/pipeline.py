@@ -130,13 +130,19 @@ class Pipeline:
 
         state = None if self.start_fresh else manifest_mod.load_state(self.server_name, vname)
         if state and state.get("status") == "done":
+            orig_prefix = state.get("key_prefix") or key_prefix
+            orig_manifest = f"{orig_prefix}.manifest.json"
             if self.merge_on_complete and not state.get("merged_key"):
                 # use the ORIGINAL key prefix from the saved state, not today's
                 # date — the segments/manifest live under the capture date
-                orig_prefix = state.get("key_prefix") or key_prefix
                 self._merge_volume(f"{vol.letter}:", vname, state,
-                                   f"{orig_prefix}.manifest.json", orig_prefix)
+                                   orig_manifest, orig_prefix)
                 return state
+            if self.delete_segments_after_merge and state.get("merged_key") \
+                    and not state.get("segments_deleted"):
+                # merged in an earlier run — apply the verified-delete gate now
+                self._delete_segments_gated(f"{vol.letter}:", vname, state,
+                                            orig_manifest)
             self.log(f"{vol.letter}: already complete in saved state — skipped")
             self._cb("volume_done", f"{vol.letter}:", state)
             return state
@@ -273,11 +279,16 @@ class Pipeline:
 
         state = None if self.start_fresh else manifest_mod.load_state(self.server_name, vname)
         if state and state.get("status") == "done":
+            orig_prefix = state.get("key_prefix") or key_prefix
+            orig_manifest = f"{orig_prefix}.manifest.json"
             if self.merge_on_complete and not state.get("merged_key"):
-                orig_prefix = state.get("key_prefix") or key_prefix
                 self._merge_volume(display, vname, state,
-                                   f"{orig_prefix}.manifest.json", orig_prefix)
+                                   orig_manifest, orig_prefix)
                 return state
+            if self.delete_segments_after_merge and state.get("merged_key") \
+                    and not state.get("segments_deleted"):
+                self._delete_segments_gated(display, vname, state,
+                                            orig_manifest)
             self.log(f"{display}: already complete in saved state — skipped")
             self._cb("volume_done", display, state)
             return state
@@ -351,19 +362,44 @@ class Pipeline:
             self.log(f"{display}: merged -> {merged_key} "
                      f"({res['total_size']:,} bytes, {res['parts']} part(s))")
             if self.delete_segments_after_merge:
-                for s in state["segments"]:
-                    try:
-                        self.store.delete_object(s["key"])
-                    except Exception as e:
-                        self.log(f"  WARNING: could not delete {s['key']}: {e}")
-                state["segments_deleted"] = True
-                manifest_mod.save_state(self.server_name, vname, state)
-                manifest_mod.upload_manifest(self.store, manifest_key, state)
-                self.log(f"{display}: segment objects deleted "
-                         "(merged object retained)")
+                self._delete_segments_gated(display, vname, state, manifest_key)
         except Exception as e:
             self.log(f"{display}: merge FAILED ({e}) — segments and state "
                      "are untouched")
+
+    def _delete_segments_gated(self, display, vname, state, manifest_key):
+        """Delete segment objects ONLY after the merged object verifies
+        end-to-end (head size + per-chunk 7za t + streamed SHA-256 vs
+        manifest). Failure keeps segments and logs a loud error."""
+        if state.get("segments_deleted") or not state.get("merged_key"):
+            return
+        self._cb("status", f"{display}:",
+                 "verifying merged object before deleting segments…")
+        self.log(f"{display}: verifying merged object end-to-end before "
+                 "deletion (downloads it once)")
+        ok = verify_merged(self.store, state, log=self.log,
+                           cancel_event=self.cancel_event)
+        if not ok:
+            self.log(f"{display}: MERGED VERIFICATION FAILED — segment "
+                     "objects KEPT (nothing deleted)")
+            return
+        for s in state["segments"]:
+            try:
+                self.store.delete_object(s["key"])
+                self.log(f"  deleted {s['key']}")
+            except Exception as e:
+                self.log(f"  WARNING: could not delete {s['key']}: {e}")
+        state["segments_deleted"] = True
+        state["merged_verified"] = True
+        state["merged_verified_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                    time.gmtime())
+        manifest_mod.save_state(self.server_name, vname, state)
+        try:
+            manifest_mod.upload_manifest(self.store, manifest_key, state)
+        except Exception as e:
+            self.log(f"{display}: WARNING manifest upload failed: {e}")
+        self.log(f"{display}: merged object verified — segment objects "
+                 "deleted (merged object retained)")
 
     def _verified_segments(self, state):
         ok = []
@@ -462,11 +498,65 @@ class Pipeline:
 
 
 # ---- verify ---------------------------------------------------------------
+def verify_merged(store, manifest, log=print, cancel_event=None,
+                  progress=None):
+    """Verify the MERGED object end-to-end: HeadObject size, stream-download
+    split into per-segment chunks at the manifest offsets, `7za t` + streamed
+    `7za x -so` SHA-256 per chunk vs manifest. Proves restorability."""
+    from .restore import extract_check, fetch_chunks
+    merged_key = manifest.get("merged_key")
+    if not merged_key:
+        log("verify_merged: manifest has no merged_key")
+        return False
+    expected = manifest.get("merged", {}).get("total_size")
+    head = store.head_object(merged_key)
+    if not head:
+        log(f"verify_merged: {merged_key} missing")
+        return False
+    if expected is not None and head["size"] != expected:
+        log(f"verify_merged: size mismatch — remote {head['size']:,} vs "
+            f"manifest {expected:,}")
+        return False
+    log(f"verify_merged: {merged_key} ({head['size']:,} bytes) — "
+        "downloading and checking each chunk")
+    sevenzip = find_sevenzip()
+    tmpdir = tempfile.mkdtemp(prefix="vhd2w-vmerge-")
+    all_ok = True
+    try:
+        chunks = fetch_chunks(store, manifest, tmpdir, log=log,
+                              progress=progress, cancel_event=cancel_event)
+        for seg, cf in chunks:
+            if cancel_event and cancel_event.is_set():
+                log("verify cancelled")
+                return False
+            try:
+                got = extract_check(sevenzip, cf, seg)
+                log(f"  merged part{seg['index'] + 1:03d}: PASS — "
+                    f"{got:,} bytes, sha256 ok")
+            except Exception as e:
+                all_ok = False
+                log(f"  merged part{seg['index'] + 1:03d}: FAIL — {e}")
+        log(f"verify_merged {'PASSED' if all_ok else 'FAILED'}: {merged_key}")
+        return all_ok
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def verify_manifest(store, manifest_key, log=print, result_cb=None,
-                    cancel_event=None):
-    """HeadObject + download + `7za t` + stream-extract hash check per segment."""
+                    cancel_event=None, use_merged=None):
+    """Verify a manifest: via the merged object when it has one (default),
+    else per-segment HeadObject + download + `7za t` + streamed hash."""
     m = manifest_mod.download_manifest(store, manifest_key)
-    log(f"Verifying {manifest_key}")
+    if use_merged is None:
+        use_merged = bool(m.get("merged_key"))
+    if use_merged:
+        if not m.get("merged_key"):
+            log("no merged object in manifest — falling back to per-segment")
+        else:
+            log(f"Verifying {manifest_key} via MERGED object "
+                f"{m['merged_key']}")
+            return verify_merged(store, m, log=log, cancel_event=cancel_event)
+    log(f"Verifying {manifest_key} (per-segment)")
     log(f"  server={m.get('server')} volume={m.get('volume')} "
         f"size={m.get('total_size'):,} segments={len(m.get('segments', []))}")
     sevenzip = find_sevenzip()

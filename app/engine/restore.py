@@ -61,6 +61,96 @@ def _unique_path(dest_dir, filename):
     return candidate
 
 
+def fetch_chunks(store, manifest, chunk_dir, log=lambda m: None,
+                 progress=None, cancel_event=None):
+    """Download per-segment .7z chunk files into chunk_dir: from the merged
+    object (streamed in one pass, split at the manifest's byte offsets) when
+    merged_key exists, else per-segment objects. Returns [(seg, path)].
+    Caller owns chunk_dir cleanup."""
+    segments = manifest.get("segments", [])
+    n = len(segments)
+    chunk_files = []
+    downloaded = 0
+
+    def pump_to_file(stream, size, path):
+        nonlocal downloaded
+        with open(path, "wb") as f:
+            left = size
+            while left > 0:
+                if cancel_event and cancel_event.is_set():
+                    raise RestoreError("cancelled")
+                b = stream.read(min(DL_CHUNK, left))
+                if not b:
+                    raise RestoreError("download truncated")
+                f.write(b)
+                left -= len(b)
+                downloaded += len(b)
+                if progress:
+                    progress("downloading", downloaded, 0, None, n)
+
+    merged_key = manifest.get("merged_key")
+    if merged_key:
+        offsets = {o["index"]: o for o in manifest["merged"]["offsets"]}
+        log(f"streaming merged object {merged_key}")
+        stream, _total = store.open_stream(merged_key)
+        try:
+            for s in segments:
+                o = offsets[s["index"]]
+                cf = os.path.join(chunk_dir, f"seg{s['index']:04d}.7z")
+                pump_to_file(stream, o["compressed_size"], cf)
+                chunk_files.append((s, cf))
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+    else:
+        for s in segments:
+            cf = os.path.join(chunk_dir, f"seg{s['index']:04d}.7z")
+            log(f"downloading {s['key'].rsplit('/', 1)[-1]}")
+            store.download_file(s["key"], cf)
+            head = os.path.getsize(cf)
+            downloaded += head
+            if head != s["compressed_size"]:
+                raise RestoreError(f"download size mismatch for {s['key']}")
+            if progress:
+                progress("downloading", downloaded, 0, s["index"], n)
+            chunk_files.append((s, cf))
+    return chunk_files
+
+
+def extract_check(sevenzip, chunk_path, seg, sink=None, read_cb=None):
+    """`7za t` + streamed `7za x -so`; bytes go to `sink` (file obj) if given.
+    Always verifies extracted size + SHA-256 against the manifest segment.
+    Raises RestoreError on any failure; returns extracted byte count."""
+    t = subprocess.run([sevenzip, "t", chunk_path], capture_output=True,
+                       timeout=7200)
+    if t.returncode != 0:
+        raise RestoreError(f"7-Zip integrity test failed for segment "
+                           f"{seg['index'] + 1}")
+    p = subprocess.Popen([sevenzip, "x", "-so", chunk_path],
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    hasher = hashlib.sha256()
+    got = 0
+    while True:
+        b = p.stdout.read(DL_CHUNK)
+        if not b:
+            break
+        if sink is not None:
+            sink.write(b)
+        hasher.update(b)
+        got += len(b)
+        if read_cb:
+            read_cb(len(b))
+    p.wait()
+    if p.returncode != 0:
+        raise RestoreError(f"7-Zip extract failed for segment {seg['index'] + 1}")
+    if got != seg["raw_size"] or hasher.hexdigest() != seg["raw_sha256"]:
+        raise RestoreError(
+            f"segment {seg['index'] + 1} hash/size mismatch after extract")
+    return got
+
+
 def restore(store, manifest, dest_dir, log=lambda m: None,
             progress=None, cancel_event=None):
     """progress(stage_text, downloaded_bytes, extracted_bytes, seg_i, seg_n).
@@ -75,82 +165,26 @@ def restore(store, manifest, dest_dir, log=lambda m: None,
     out_path = _unique_path(dest_dir, output_name(manifest))
     chunk_dir = tempfile.mkdtemp(prefix=".vhd2w-chunks-", dir=dest_dir)
     n = len(segments)
-    downloaded = 0
     extracted = 0
 
-    def pump_to_file(stream, size, path):
-        nonlocal downloaded
-        with open(path, "wb") as f:
-            left = size
-            while left > 0:
-                if cancel_event and cancel_event.is_set():
-                    raise RestoreError("restore cancelled")
-                b = stream.read(min(DL_CHUNK, left))
-                if not b:
-                    raise RestoreError("download truncated")
-                f.write(b)
-                left -= len(b)
-                downloaded += len(b)
-                if progress:
-                    progress("downloading", downloaded, extracted, None, n)
-
     try:
-        chunk_files = []
-        merged_key = manifest.get("merged_key")
-        if merged_key:
-            offsets = {o["index"]: o for o in manifest["merged"]["offsets"]}
-            log(f"restore: streaming merged object {merged_key}")
-            stream, _total = store.open_stream(merged_key)
-            try:
-                for s in segments:
-                    o = offsets[s["index"]]
-                    cf = os.path.join(chunk_dir, f"seg{s['index']:04d}.7z")
-                    pump_to_file(stream, o["compressed_size"], cf)
-                    chunk_files.append((s, cf))
-            finally:
-                try:
-                    stream.close()
-                except Exception:
-                    pass
-        else:
-            for s in segments:
-                cf = os.path.join(chunk_dir, f"seg{s['index']:04d}.7z")
-                log(f"restore: downloading {s['key'].rsplit('/', 1)[-1]}")
-                store.download_file(s["key"], cf)
-                head = os.path.getsize(cf)
-                downloaded += head
-                if head != s["compressed_size"]:
-                    raise RestoreError(f"download size mismatch for {s['key']}")
-                if progress:
-                    progress("downloading", downloaded, extracted, s["index"], n)
-                chunk_files.append((s, cf))
+        log("restore: fetching segment data")
+        chunk_files = fetch_chunks(store, manifest, chunk_dir, log=log,
+                                   progress=progress, cancel_event=cancel_event)
+        downloaded = sum(os.path.getsize(cf) for _s, cf in chunk_files)
 
         log(f"restore: writing {out_path}")
         with open(out_path, "wb") as out:
             for i, (s, cf) in enumerate(chunk_files):
                 if cancel_event and cancel_event.is_set():
                     raise RestoreError("restore cancelled")
-                if progress:
-                    progress("extracting", downloaded, extracted, i + 1, n)
-                p = subprocess.Popen([sevenzip, "x", "-so", cf],
-                                     stdout=subprocess.PIPE,
-                                     stderr=subprocess.DEVNULL)
-                hasher = hashlib.sha256()
-                got = 0
-                while True:
-                    b = p.stdout.read(DL_CHUNK)
-                    if not b:
-                        break
-                    out.write(b)
-                    hasher.update(b)
-                    got += len(b)
-                    extracted += len(b)
-                p.wait()
-                if p.returncode != 0:
-                    raise RestoreError(f"7-Zip extract failed for segment {s['index'] + 1}")
-                if got != s["raw_size"] or hasher.hexdigest() != s["raw_sha256"]:
-                    raise RestoreError(
-                        f"segment {s['index'] + 1} hash/size mismatch after extract")
+
+                def cb(cnt, i=i):
+                    nonlocal extracted
+                    extracted += cnt
+                    if progress:
+                        progress("extracting", downloaded, extracted, i + 1, n)
+                extract_check(sevenzip, cf, s, sink=out, read_cb=cb)
                 try:
                     os.remove(cf)
                 except OSError:
