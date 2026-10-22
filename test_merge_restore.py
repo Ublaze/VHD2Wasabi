@@ -121,7 +121,7 @@ def test_e2e(tmp):
         res = restore_mod.restore(store, manifest, dest,
                                   log=lambda m: print("   ", m))
         assert res["footer"], f"footer validation failed ({mode})"
-        assert os.path.basename(res["path"]) == "MERGEBOX_M.vhd", res["path"]
+        assert os.path.basename(res["path"]) == "MERGEBOX-M.vhd", res["path"]
         with open(res["path"], "rb") as f:
             data = f.read()
         assert len(data) == SIZE + 512
@@ -273,18 +273,18 @@ def test_output_naming(tmp):
     m_label_only = {"server": "TRX3WEB", "volume": "Windows"}
     m_bad_chars = {"server": "TR/X3:WEB", "volume": "Disk0",
                    "capture_kind": "disk"}
-    assert output_name(m_disk) == "TRX3WEB_Disk0.vhd"
-    assert output_name(m_vol) == "TRX3WEB_C.vhd"
-    assert output_name(m_vol_old) == "TRX3WEB_F.vhd"
-    assert output_name(m_label_only) == "TRX3WEB_Windows.vhd"
+    assert output_name(m_disk) == "TRX3WEB-Disk0.vhd"
+    assert output_name(m_vol) == "TRX3WEB-C.vhd"
+    assert output_name(m_vol_old) == "TRX3WEB-F.vhd"
+    assert output_name(m_label_only) == "TRX3WEB-Windows.vhd"
     assert "/" not in output_name(m_bad_chars) and ":" not in output_name(m_bad_chars)
     d = os.path.join(tmp, "naming")
     os.makedirs(d)
-    p1 = _unique_path(d, "TRX3WEB_C.vhd")
+    p1 = _unique_path(d, "TRX3WEB-C.vhd")
     open(p1, "w").close()
-    p2 = _unique_path(d, "TRX3WEB_C.vhd")
+    p2 = _unique_path(d, "TRX3WEB-C.vhd")
     assert p2 != p1 and "(2)" in p2 and not os.path.exists(p2)
-    print("   TRX3WEB_C.vhd / TRX3WEB_F.vhd / TRX3WEB_Disk0.vhd, collision -> ' (2)': OK")
+    print("   TRX3WEB-C.vhd / TRX3WEB-F.vhd / TRX3WEB-Disk0.vhd, collision -> ' (2)': OK")
 
 
 def test_gated_delete(tmp):
@@ -342,7 +342,7 @@ def test_gated_delete(tmp):
     # restore from merged still passes after deletion
     res = restore_mod.restore(store, m, os.path.join(tmp, "restore-gated"))
     assert res["footer"], "restore-from-merged failed after segment deletion"
-    assert os.path.basename(res["path"]) == "GATEBOX_M.vhd"
+    assert os.path.basename(res["path"]) == "GATEBOX-M.vhd"
     print(f"   segments deleted, merged verified, restore OK -> "
           f"{os.path.basename(res['path'])}")
 
@@ -463,6 +463,68 @@ def test_magic_shift_detection(tmp):
     print("   corrupted segment boundary detected by magic check: OK")
 
 
+def test_legacy_state_compat(tmp):
+    print("== legacy label-based state/keys stay put; rerun merges in place ==")
+    src = os.path.join(tmp, "vol7.img")
+    gen_source(src)
+    store = LocalDirStore(os.path.join(tmp, "bucket10"))
+    spool = os.path.join(tmp, "spool10")
+    os.makedirs(spool)
+    manifest_mod.STATE_ROOT = os.path.join(tmp, "state10")
+    server = "LEGBOX"
+    vol = FakeVol()  # letter M, label MERGEVOL
+    p1 = pipeline_mod.Pipeline(
+        store, "pfx", server, segment_size_mb=64, level=5, spool_dir=spool,
+        use_vss=False, reader_factory=lambda v: FileReader(src, SIZE),
+        merge_on_complete=False)
+    s1 = p1.run_volume(vol)
+    new_prefix = s1["key_prefix"]
+    assert new_prefix.endswith(f"/{server}-M")
+
+    # convert to a LEGACY capture: label-based keys + label-named state file
+    legacy_prefix = new_prefix[:new_prefix.rfind("/")] + "/MERGEVOL"
+    st = manifest_mod.load_state(server, "M")
+    st["key_prefix"] = legacy_prefix
+    st.pop("drive_letter", None)  # legacy manifests have no drive_letter
+
+    def move(old_key, new_key):
+        os.replace(store._path(old_key), store._path(new_key))
+        if os.path.isfile(store._path(old_key) + ".etag"):
+            os.replace(store._path(old_key) + ".etag",
+                       store._path(new_key) + ".etag")
+    for seg in st["segments"]:
+        nk = seg["key"].replace(f"/{server}-M.", "/MERGEVOL.")
+        move(seg["key"], nk)
+        seg["key"] = nk
+    move(f"{new_prefix}.manifest.json", f"{legacy_prefix}.manifest.json")
+    manifest_mod.save_state(server, "MERGEVOL", st)     # legacy state name
+    manifest_mod.upload_manifest(store, f"{legacy_prefix}.manifest.json", st)
+    os.remove(manifest_mod.state_path(server, "M"))     # only legacy exists
+
+    # rerun: done-but-unmerged legacy state -> merge under ORIGINAL prefix,
+    # nothing re-uploaded, nothing under the new basename
+    p2 = pipeline_mod.Pipeline(
+        store, "pfx", server, segment_size_mb=64, level=5, spool_dir=spool,
+        use_vss=False, reader_factory=lambda v: (_ for _ in ()).throw(
+            AssertionError("reader must not be opened")),
+        merge_on_complete=True, delete_segments_after_merge=True,
+        callbacks={"log": lambda m: print("  ", m)})
+    s2 = p2.run_volume(vol)
+    assert s2["merged_key"].startswith(legacy_prefix), s2["merged_key"]
+    assert s2.get("segments_deleted") is True
+    stray = [k for k in store.list_keys("pfx") if f"/{server}-M." in k]
+    assert not stray, f"objects re-uploaded under new basename: {stray}"
+    # legacy manifest still verifies + restores (keys read from inside it)
+    mkey = f"{legacy_prefix}.manifest.json"
+    assert pipeline_mod.verify_manifest(store, mkey, log=lambda m: None)
+    m = manifest_mod.download_manifest(store, mkey)
+    res = restore_mod.restore(store, m, os.path.join(tmp, "restore-legacy"))
+    assert res["footer"], "legacy manifest restore failed"
+    assert os.path.basename(res["path"]) == "LEGBOX-M.vhd"  # letter from "M: (MERGEVOL)"
+    print(f"   legacy merge-in-place + verify + restore OK -> "
+          f"{os.path.basename(res['path'])}")
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="vhd2w-mr-")
     try:
@@ -475,6 +537,7 @@ def main():
         test_gated_delete_corruption(tmp)
         test_inline_part_hash(tmp)
         test_magic_shift_detection(tmp)
+        test_legacy_state_compat(tmp)
         test_merge_failure(tmp)
         print("test_merge_restore: ALL PASSED")
     finally:

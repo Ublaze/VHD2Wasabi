@@ -155,7 +155,7 @@ def test_e2e(tmp):
     dest = os.path.join(tmp, "restore")
     res = restore_mod.restore(store, state, dest, log=lambda m: print("   ", m))
     assert res["footer"], "footer validation failed"
-    assert os.path.basename(res["path"]) == "DISKBOX_Disk0.vhd", res["path"]
+    assert os.path.basename(res["path"]) == "DISKBOX-Disk0.vhd", res["path"]
     with open(res["path"], "rb") as f:
         data = f.read()
     assert len(data) == DISK_LEN + 512

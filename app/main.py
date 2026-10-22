@@ -621,7 +621,9 @@ class App(tk.Tk):
                     self.pipeline.run_disks([self.disk_var.get()])
                 else:
                     for v in vols:
-                        st = manifest_mod.load_state(socket.gethostname(), v.safe_name())
+                        st = manifest_mod.load_state(socket.gethostname(), v.letter) \
+                            or manifest_mod.load_state(socket.gethostname(),
+                                                       v.safe_name())
                         if st and st.get("status") != "done" and not self.fresh_var.get():
                             self.log(f"{v.letter}: saved state found — resuming automatically")
                     self.pipeline.run_volumes(vols)

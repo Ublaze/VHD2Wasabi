@@ -228,12 +228,21 @@ pick one, choose a destination folder, click **Restore**.
   and are deleted as consumed).
 - Otherwise the segment objects are downloaded one by one.
 - Each chunk is extracted streaming (`7za x -so`) and appended to
-  `<Volume>.vhd`; per-segment SHA-256 is verified against the manifest.
+  `<server>-<identity>.vhd`; per-segment SHA-256 is verified against the manifest.
 - At the end the VHD footer checksum is validated and "footer OK" reported.
-- Output files are named `<server>_<identity>.vhd` (identity = original drive
+- Output files are named `<server>-<identity>.vhd` (identity = original drive
   letter for volume captures, `Disk<N>` for disk captures), e.g.
-  `TRX3WEB_C.vhd`, `TRX3WEB_Disk0.vhd`; existing files are never overwritten
+  `TRX3APP-C.vhd`, `TRX3APP-Disk0.vhd`; existing files are never overwritten
   (` (2)` is appended).
+
+**Bucket object naming**: capture objects are named `<server>-<identity>` too
+(`<prefix>/<server>/<date>/TRX3APP-C.part001.7z`, `…/TRX3APP-C.full.7zcat`,
+`…/TRX3APP-C.manifest.json`; disks: `TRX3APP-Disk0.*`). Manifest identity
+fields keep full info (letter + label). Captures made with older versions
+(label-based names like `Windows.part001.7z`) keep working: state is matched
+by drive letter/disk identity, keys are always read from inside the manifest,
+and a rerun resumes/merges under the ORIGINAL key prefix recorded in state —
+nothing is renamed or re-uploaded.
 - Progress (downloaded / extracted MB, current segment n/N) shows in the
   status line; Cancel aborts cleanly.
 

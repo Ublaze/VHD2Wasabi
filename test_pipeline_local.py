@@ -114,12 +114,14 @@ def main():
         assert state["total_size"] == SIZE + 512
         segs = state["segments"]
         assert len(segs) == (SIZE + 512 + p.segment_size - 1) // p.segment_size
-        print(f"segments: {len(segs)}")
+        # new naming: object basename = <server>-<letter>
+        assert segs[0]["key"].endswith("/TESTBOX-T.part001.7z"), segs[0]["key"]
+        assert state["key_prefix"].endswith("/TESTBOX-T"), state["key_prefix"]
+        print(f"segments: {len(segs)} — keys {segs[0]['key']} …")
 
         # reassemble: extract every .7z part, concat, compare with source+footer
         date_dir = os.path.join(tmp, "bucket", "testprefix", server)
         day = os.listdir(date_dir)[0]
-        partdir = os.path.join(date_dir, day, "FAKEVOL")
         # expected device bytes: full source with the unreadable tail zero-padded
         expect = hashlib.sha256()
         with open(src, "rb") as f:
@@ -188,12 +190,12 @@ def main():
 
         # partial resume: "N segments planned, N-1 complete" — drop the last
         # segment from state AND its object, rerun, only that segment is redone
-        st = manifest_mod.load_state(server, "FAKEVOL")
+        st = manifest_mod.load_state(server, "T")
         last = st["segments"].pop()
         os.remove(os.path.join(tmp, "bucket", last["key"].replace("/", os.sep)))
         st["status"] = "in_progress"
         st["image_sha256"] = None
-        manifest_mod.save_state(server, "FAKEVOL", st)
+        manifest_mod.save_state(server, "T", st)
         p3 = pipeline_mod.Pipeline(
             store, "testprefix", server, segment_size_mb=SEG_MB, level=5,
             spool_dir=spool, use_vss=False,

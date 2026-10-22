@@ -21,6 +21,12 @@ DIFF_WARN = 0.80
 DIFF_ABORT = 0.95
 
 
+def _san(s):
+    """S3-safe basename component."""
+    return "".join(c if c.isalnum() or c in "-_." else "_" for c in str(s)) \
+        or "x"
+
+
 class Cancelled(RuntimeError):
     pass
 
@@ -125,12 +131,26 @@ class Pipeline:
 
     def run_volume(self, vol):
         date = time.strftime("%Y-%m-%d")
-        vname = vol.safe_name()
-        key_prefix = f"{self.key_prefix}/{self.server_name}/{date}/{vname}" \
-            if self.key_prefix else f"{self.server_name}/{date}/{vname}"
+        # object basename = <server>-<letter> (e.g. TRX3APP-C); state is keyed
+        # by drive letter, falling back to the legacy label-based state name
+        # so completed/in-progress captures from older versions stay matched
+        basename = f"{_san(self.server_name)}-{vol.letter}"
+        state_name = vol.letter
+        legacy_name = vol.safe_name()
+        key_prefix = f"{self.key_prefix}/{self.server_name}/{date}/{basename}" \
+            if self.key_prefix else f"{self.server_name}/{date}/{basename}"
         manifest_key = f"{key_prefix}.manifest.json"
 
-        state = None if self.start_fresh else manifest_mod.load_state(self.server_name, vname)
+        state = None
+        if not self.start_fresh:
+            state = manifest_mod.load_state(self.server_name, state_name) \
+                or manifest_mod.load_state(self.server_name, legacy_name)
+        if state and state.get("key_prefix"):
+            # resume in place under the ORIGINAL key prefix (56b73e0 rule) —
+            # never rename or re-upload existing objects
+            key_prefix = state["key_prefix"]
+            manifest_key = f"{key_prefix}.manifest.json"
+        vname = state_name
         if state and state.get("status") == "done":
             orig_prefix = state.get("key_prefix") or key_prefix
             orig_manifest = f"{orig_prefix}.manifest.json"
@@ -168,10 +188,11 @@ class Pipeline:
                 mon.start()
                 reader = VolumeReader(device, log=self.log)
             return self._stream_segments(f"{vol.letter}:", vname, vol.letter,
-                                         f"{vol.letter}: ({vname})", reader,
+                                         f"{vol.letter}: ({vol.safe_name()})", reader,
                                          state, key_prefix, manifest_key,
                                          extra={"capture_kind": "volume",
-                                                "drive_letter": vol.letter})
+                                                "drive_letter": vol.letter,
+                                                "label": vol.label})
 
         except Cancelled:
             self.log(f"{vol.letter}: cancelled — state preserved for resume")
@@ -273,13 +294,17 @@ class Pipeline:
     def run_disk(self, disk_number):
         from .diskreader import LayoutChangedError, build_disk_reader, layouts_equal
         date = time.strftime("%Y-%m-%d")
-        vname = f"Disk{disk_number}"
-        key_prefix = f"{self.key_prefix}/{self.server_name}/{date}/{vname}" \
-            if self.key_prefix else f"{self.server_name}/{date}/{vname}"
+        vname = f"Disk{disk_number}"  # state name (stable identity)
+        basename = f"{_san(self.server_name)}-{vname}"  # object basename
+        key_prefix = f"{self.key_prefix}/{self.server_name}/{date}/{basename}" \
+            if self.key_prefix else f"{self.server_name}/{date}/{basename}"
         manifest_key = f"{key_prefix}.manifest.json"
         display = vname
 
         state = None if self.start_fresh else manifest_mod.load_state(self.server_name, vname)
+        if state and state.get("key_prefix"):
+            key_prefix = state["key_prefix"]
+            manifest_key = f"{key_prefix}.manifest.json"
         if state and state.get("status") == "done":
             orig_prefix = state.get("key_prefix") or key_prefix
             orig_manifest = f"{orig_prefix}.manifest.json"

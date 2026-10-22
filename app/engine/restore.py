@@ -30,7 +30,7 @@ def _sanitize(s):
 
 
 def output_name(manifest):
-    """<server>_<identity>.vhd — identity is the original drive letter for
+    """<server>-<identity>.vhd — identity is the original drive letter for
     volume captures (fallback: label), Disk<N> for disk captures."""
     server = _sanitize(manifest.get("server") or "unknown")
     vol = manifest.get("volume", "")
@@ -47,7 +47,7 @@ def output_name(manifest):
                 ident = vol[vol.index("(") + 1:-1]
             else:
                 ident = vol or "volume"
-    return f"{server}_{_sanitize(ident)}.vhd"
+    return f"{server}-{_sanitize(ident)}.vhd"
 
 
 def _unique_path(dest_dir, filename):
